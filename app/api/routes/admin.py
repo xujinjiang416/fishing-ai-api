@@ -29,6 +29,7 @@ from ...models import (
     MembershipOrder,
     OperationLog,
     Order,
+    OrderLog,
     Plan,
     Spot,
     SpotComment,
@@ -44,12 +45,18 @@ from ...schemas.admin import (
     GoodsIn,
     GoodsUpdateIn,
     MembershipAssignIn,
+    OrderAddressIn,
+    OrderRefundIn,
+    OrderRemarkIn,
+    OrderShipIn,
     PlanIn,
     PlanUpdateIn,
     PointsConfigIn,
     SpotIn,
     SpotUpdateIn,
     admin_comment_out,
+    admin_order_detail_out,
+    admin_order_out,
     admin_out,
     admin_user_out,
     goods_admin_out,
@@ -61,6 +68,7 @@ from ...schemas.admin import (
 )
 from ...schemas.schemas import mask_phone, order_out
 from ...services import ai, config_service, oplog
+from .user import add_points
 
 router = APIRouter(prefix="/admin", tags=["管理后台"])
 
@@ -138,7 +146,7 @@ async def overview(
         await db.scalars(select(User.created_at).where(User.created_at >= start))
     ).all()
     order_rows = (
-        await db.scalars(
+        await db.execute(
             select(Order.created_at, Order.pay_amount).where(Order.created_at >= start)
         )
     ).all()
@@ -1134,3 +1142,519 @@ async def membership_stats(
             "recent": recent,
         }
     )
+
+
+# ================= 订单管理 =================
+# 订单状态全集（与小程序 / 后台共用一套中文状态）
+ORDER_STATUSES = ["待支付", "待发货", "已发货", "已完成", "已关闭", "退款中", "部分退款", "已退款"]
+# 只读角色：可查看 / 导出，但不能执行订单操作（关闭 / 发货 / 退款等）
+ORDER_READONLY_ROLES = ("只读管理员", "观察员", "审计员")
+
+# 导出字段白名单：key -> 中文表头（前端按 key 自定义选择导出列）
+ORDER_EXPORT_FIELDS: dict[str, str] = {
+    "no": "订单编号",
+    "user": "下单用户",
+    "uid": "用户ID",
+    "userPhone": "用户手机号",
+    "goods": "商品",
+    "qty": "数量",
+    "total": "商品金额",
+    "usePoints": "抵扣积分",
+    "amount": "实付金额",
+    "payMethod": "支付方式",
+    "payStatus": "支付状态",
+    "status": "订单状态",
+    "deliveryType": "配送方式",
+    "receiver": "收货人",
+    "receiverPhone": "收货电话",
+    "address": "收货地址",
+    "logisticsCompany": "物流公司",
+    "logisticsNo": "物流单号",
+    "refundAmount": "退款金额",
+    "remark": "备注",
+    "createdAt": "下单时间",
+    "paidAt": "支付时间",
+    "shippedAt": "发货时间",
+}
+
+
+def _require_order_write(admin: Admin) -> None:
+    """订单写操作权限校验：只读角色禁止操作。"""
+    if (admin.role or "") in ORDER_READONLY_ROLES:
+        raise HTTPException(status_code=403, detail="当前角色无订单操作权限")
+
+
+def _parse_day(value: str, end: bool = False) -> datetime | None:
+    """把 YYYY-MM-DD 解析成当天 00:00；end=True 时返回次日 00:00（用于闭区间）。"""
+    try:
+        d = datetime.strptime(value.strip()[:10], "%Y-%m-%d")
+    except (ValueError, AttributeError):
+        return None
+    return d + timedelta(days=1) if end else d
+
+
+def _order_stmt(
+    keyword: str | None = None,
+    userKeyword: str | None = None,
+    startDate: str | None = None,
+    endDate: str | None = None,
+    payMethod: str | None = None,
+    status: str | None = None,
+    deliveryType: str | None = None,
+    quick: str | None = None,
+):
+    """按筛选条件构建订单查询（联表用户，便于按昵称 / 手机号 / UID 过滤）。"""
+    stmt = select(Order, User).outerjoin(User, User.id == Order.user_id)
+
+    if keyword and keyword.strip():
+        k = f"%{keyword.strip()}%"
+        stmt = stmt.where(or_(Order.order_no.like(k), Order.goods_name.like(k)))
+    if userKeyword and userKeyword.strip():
+        k = f"%{userKeyword.strip()}%"
+        stmt = stmt.where(or_(User.nickname.like(k), User.uid.like(k), User.phone.like(k)))
+    if startDate:
+        start = _parse_day(startDate)
+        if start:
+            stmt = stmt.where(Order.created_at >= start)
+    if endDate:
+        end = _parse_day(endDate, end=True)
+        if end:
+            stmt = stmt.where(Order.created_at < end)
+    if payMethod and payMethod != "all":
+        stmt = stmt.where(Order.pay_method == payMethod)
+    if deliveryType and deliveryType != "all":
+        stmt = stmt.where(Order.delivery_type == deliveryType)
+    if status and status != "all":
+        statuses = [s.strip() for s in status.split(",") if s.strip()]
+        if statuses:
+            stmt = stmt.where(Order.status.in_(statuses))
+
+    if quick == "today":
+        stmt = stmt.where(Order.created_at >= datetime.combine(date.today(), time.min))
+    elif quick == "unpaid":
+        stmt = stmt.where(Order.status == "待支付")
+    elif quick == "unshipped":
+        stmt = stmt.where(Order.status == "待发货")
+    elif quick == "shipped":
+        stmt = stmt.where(Order.status == "已发货")
+    elif quick == "refunding":
+        stmt = stmt.where(or_(Order.status == "退款中", Order.refund_status == "processing"))
+    elif quick == "abnormal":
+        stmt = stmt.where(Order.abnormal.is_(True))
+
+    return stmt
+
+
+async def _goods_map(db: AsyncSession, orders: list[Order]) -> dict[str, Goods]:
+    """批量取订单关联商品（用于图片 / 分类），避免 N+1 查询。"""
+    ids = {o.goods_id for o in orders if o.goods_id}
+    if not ids:
+        return {}
+    rows = (await db.scalars(select(Goods).where(Goods.id.in_(ids)))).all()
+    return {g.id: g for g in rows}
+
+
+def _order_log(
+    db: AsyncSession,
+    order_no: str,
+    action: str,
+    detail: str,
+    admin: Admin | None,
+    request: Request | None = None,
+) -> None:
+    """写订单操作日志 + 全局操作日志（不提交，由调用方统一 commit）。"""
+    operator = getattr(admin, "name", None) or "系统"
+    db.add(OrderLog(order_no=order_no, action=action, operator=operator, detail=detail))
+    oplog.add_log(
+        db,
+        action=f"order.{action}",
+        admin=admin,
+        target=order_no,
+        detail=detail,
+        ip=_admin_ip(request),
+    )
+
+
+@router.get("/orders/stats", summary="订单统计概览（今日 / 待处理 / 近 7 日趋势）")
+async def order_stats(
+    admin: Admin = Depends(get_current_admin), db: AsyncSession = Depends(get_db)
+):
+    today_start = datetime.combine(date.today(), time.min)
+    # 今日成交金额只统计已支付及之后的状态（排除待支付 / 已关闭）
+    paid_statuses = ["待发货", "已发货", "已完成", "退款中", "部分退款", "已退款"]
+
+    today_count = await db.scalar(
+        select(func.count()).select_from(Order).where(Order.created_at >= today_start)
+    ) or 0
+    today_amount = await db.scalar(
+        select(func.coalesce(func.sum(Order.pay_amount), 0)).where(
+            Order.created_at >= today_start, Order.status.in_(paid_statuses)
+        )
+    ) or 0
+
+    unpaid = await db.scalar(
+        select(func.count()).select_from(Order).where(Order.status == "待支付")
+    ) or 0
+    unshipped = await db.scalar(
+        select(func.count()).select_from(Order).where(Order.status == "待发货")
+    ) or 0
+    refunding = await db.scalar(
+        select(func.count())
+        .select_from(Order)
+        .where(or_(Order.status == "退款中", Order.refund_status == "processing"))
+    ) or 0
+    abnormal = await db.scalar(
+        select(func.count()).select_from(Order).where(Order.abnormal.is_(True))
+    ) or 0
+    total = await db.scalar(select(func.count()).select_from(Order)) or 0
+
+    # 近 7 日趋势
+    days = [date.today() - timedelta(days=6 - i) for i in range(7)]
+    start = datetime.combine(days[0], time.min)
+    rows = (
+        await db.execute(
+            select(Order.created_at, Order.pay_amount, Order.status).where(Order.created_at >= start)
+        )
+    ).all()
+    counts = [0] * 7
+    amounts = [0.0] * 7
+    for ts, amount, st in rows:
+        if not ts:
+            continue
+        idx = (ts.date() - days[0]).days
+        if 0 <= idx < 7:
+            counts[idx] += 1
+            if st in paid_statuses:
+                amounts[idx] += round(amount or 0, 2)
+
+    return ok(
+        {
+            "todayOrders": today_count,
+            "todayAmount": round(float(today_amount or 0), 2),
+            "pendingCount": unpaid + unshipped + refunding,
+            "totalOrders": total,
+            "counts": {
+                "unpaid": unpaid,
+                "unshipped": unshipped,
+                "refunding": refunding,
+                "abnormal": abnormal,
+            },
+            "trend": {
+                "days": [d.strftime("%m-%d") for d in days],
+                "counts": counts,
+                "amounts": [round(a, 2) for a in amounts],
+            },
+        }
+    )
+
+
+@router.get("/orders/export", summary="订单导出（Excel 可直接打开的 CSV，字段可选）")
+async def export_orders(
+    keyword: str | None = None,
+    userKeyword: str | None = None,
+    startDate: str | None = None,
+    endDate: str | None = None,
+    payMethod: str | None = None,
+    status: str | None = None,
+    deliveryType: str | None = None,
+    quick: str | None = None,
+    fields: str | None = None,
+    admin: Admin = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """按当前筛选条件导出订单；fields 为逗号分隔的字段 key，缺省导出全部白名单字段。"""
+    stmt = _order_stmt(
+        keyword, userKeyword, startDate, endDate, payMethod, status, deliveryType, quick
+    )
+    rows = (
+        await db.execute(stmt.order_by(Order.created_at.desc(), Order.id.desc()).limit(10000))
+    ).all()
+    orders = [o for o, _ in rows]
+    goods_map = await _goods_map(db, orders)
+
+    selected = [f.strip() for f in (fields or "").split(",") if f.strip() in ORDER_EXPORT_FIELDS]
+    if not selected:
+        selected = list(ORDER_EXPORT_FIELDS.keys())
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([ORDER_EXPORT_FIELDS[k] for k in selected])
+    for order, user in rows:
+        item = admin_order_out(order, user, goods_map.get(order.goods_id))
+        writer.writerow([item.get(k, "") for k in selected])
+
+    content = "\ufeff" + buf.getvalue()  # BOM：Excel 打开中文不乱码
+    filename = f"orders_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    return StreamingResponse(
+        iter([content.encode("utf-8")]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@router.get("/orders", summary="订单列表（多条件筛选 + 快捷筛选 + 分页）")
+async def list_orders(
+    keyword: str | None = None,
+    userKeyword: str | None = None,
+    startDate: str | None = None,
+    endDate: str | None = None,
+    payMethod: str | None = None,
+    status: str | None = None,
+    deliveryType: str | None = None,
+    quick: str | None = None,
+    page: int = 1,
+    pageSize: int = 10,
+    admin: Admin = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    page, page_size, offset = _page_args(page, pageSize)
+    stmt = _order_stmt(
+        keyword, userKeyword, startDate, endDate, payMethod, status, deliveryType, quick
+    )
+    total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    rows = (
+        await db.execute(
+            stmt.order_by(Order.created_at.desc(), Order.id.desc()).offset(offset).limit(page_size)
+        )
+    ).all()
+    goods_map = await _goods_map(db, [o for o, _ in rows])
+    items = [admin_order_out(o, u, goods_map.get(o.goods_id)) for o, u in rows]
+    return _paged(items, total, page, page_size)
+
+
+@router.get("/orders/{order_no}", summary="订单详情（含商品明细 / 支付 / 物流 / 操作日志）")
+async def order_detail(
+    order_no: str,
+    admin: Admin = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    order = await db.scalar(select(Order).where(Order.order_no == order_no))
+    if not order:
+        raise _res_404("订单")
+    user = await db.get(User, order.user_id)
+    goods = await db.get(Goods, order.goods_id) if order.goods_id else None
+    logs = (
+        await db.scalars(
+            select(OrderLog).where(OrderLog.order_no == order_no).order_by(OrderLog.id.asc())
+        )
+    ).all()
+    return ok(admin_order_detail_out(order, user, goods, logs))
+
+
+async def _get_order(db: AsyncSession, order_no: str) -> Order:
+    order = await db.scalar(select(Order).where(Order.order_no == order_no))
+    if not order:
+        raise _res_404("订单")
+    return order
+
+
+@router.post("/orders/{order_no}/close", summary="关闭待支付订单")
+async def close_order(
+    order_no: str,
+    request: Request,
+    admin: Admin = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_order_write(admin)
+    order = await _get_order(db, order_no)
+    if order.status != "待支付":
+        return fail(1001, "仅待支付订单可以关闭")
+    order.status = "已关闭"
+    order.closed_at = datetime.now()
+    _order_log(db, order_no, "close", "后台关闭订单（待支付 → 已关闭）", admin, request)
+    await db.commit()
+    return ok(admin_order_out(order, await db.get(User, order.user_id)))
+
+
+@router.post("/orders/{order_no}/ship", summary="待发货订单发货（录入物流单号）")
+async def ship_order(
+    order_no: str,
+    payload: OrderShipIn,
+    request: Request,
+    admin: Admin = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_order_write(admin)
+    order = await _get_order(db, order_no)
+    if order.status != "待发货":
+        return fail(1001, "仅待发货订单可以发货")
+    order.logistics_company = payload.logisticsCompany
+    order.logistics_no = payload.logisticsNo
+    if payload.deliveryType in ("快递", "自提"):
+        order.delivery_type = payload.deliveryType
+    order.status = "已发货"
+    order.shipped_at = datetime.now()
+    _order_log(
+        db,
+        order_no,
+        "ship",
+        f"后台发货：{payload.logisticsCompany} {payload.logisticsNo}（待发货 → 已发货）",
+        admin,
+        request,
+    )
+    await db.commit()
+    return ok(admin_order_out(order, await db.get(User, order.user_id)))
+
+
+@router.put("/orders/{order_no}/address", summary="修改收货地址（待发货 / 已发货）")
+async def update_order_address(
+    order_no: str,
+    payload: OrderAddressIn,
+    request: Request,
+    admin: Admin = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_order_write(admin)
+    order = await _get_order(db, order_no)
+    if order.status not in ("待发货", "已发货"):
+        return fail(1001, "仅待发货 / 已发货订单可以修改收货地址")
+    old = f"{order.receiver or '--'} {order.receiver_phone or '--'} {order.address or '--'}"
+    order.receiver = payload.receiver
+    order.receiver_phone = payload.receiverPhone
+    order.address = payload.address
+    _order_log(
+        db,
+        order_no,
+        "address",
+        f"修改收货地址：{old} → {payload.receiver} {payload.receiverPhone} {payload.address}",
+        admin,
+        request,
+    )
+    await db.commit()
+    return ok(admin_order_out(order, await db.get(User, order.user_id)))
+
+
+@router.post("/orders/{order_no}/remark", summary="订单备注 / 异常标记")
+async def remark_order(
+    order_no: str,
+    payload: OrderRemarkIn,
+    request: Request,
+    admin: Admin = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_order_write(admin)
+    order = await _get_order(db, order_no)
+    parts = []
+    if payload.remark is not None:
+        order.remark = payload.remark.strip()
+        parts.append(f"备注：{order.remark or '（已清空）'}")
+    if payload.abnormal is not None:
+        order.abnormal = bool(payload.abnormal)
+        parts.append("标记为异常订单" if order.abnormal else "取消异常标记")
+    if not parts:
+        return fail(1001, "没有需要保存的内容")
+    _order_log(db, order_no, "remark", "；".join(parts), admin, request)
+    await db.commit()
+    return ok(admin_order_out(order, await db.get(User, order.user_id)))
+
+
+@router.post("/orders/{order_no}/refund", summary="退款 / 部分退款申请处理")
+async def refund_order(
+    order_no: str,
+    payload: OrderRefundIn,
+    request: Request,
+    admin: Admin = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """处理退款申请：approve=true 通过（全额 → 已退款，部分 → 部分退款）；false 驳回。"""
+    _require_order_write(admin)
+    order = await _get_order(db, order_no)
+    if order.status in ("已关闭", "已退款"):
+        return fail(1001, "该订单当前状态不支持退款")
+    if order.status == "待支付":
+        return fail(1001, "未支付订单无需退款，请直接关闭")
+
+    amount = round(float(payload.amount or 0), 2)
+    reason = (payload.reason or "").strip()
+
+    if not payload.approve:
+        order.refund_status = "rejected"
+        order.refund_reason = reason
+        if order.status == "退款中":
+            order.status = "已发货" if order.shipped_at else "待发货"
+        _order_log(db, order_no, "refund", f"驳回退款申请：{reason or '未填写原因'}", admin, request)
+        await db.commit()
+        return ok(admin_order_out(order, await db.get(User, order.user_id)))
+
+    if amount <= 0:
+        return fail(1001, "请输入退款金额")
+    if amount > round(order.pay_amount or 0, 2):
+        return fail(1001, "退款金额不能超过实付金额")
+
+    is_full = amount >= round(order.pay_amount or 0, 2)
+    order.refund_amount = amount
+    order.refund_status = "approved"
+    order.refund_reason = reason
+    order.status = "已退款" if is_full else "部分退款"
+
+    user = await db.get(User, order.user_id)
+    if is_full:
+        # 全额退款：退回抵扣积分、恢复库存，保证账目一致
+        if order.use_points and user:
+            await add_points(db, user, order.use_points, f"订单 {order_no} 退款返还")
+        if order.goods_id:
+            goods = await db.get(Goods, order.goods_id)
+            if goods:
+                goods.stock = (goods.stock or 0) + (order.qty or 0)
+
+    _order_log(
+        db,
+        order_no,
+        "refund",
+        f"{'全额' if is_full else '部分'}退款 ¥{amount}：{reason or '未填写原因'}",
+        admin,
+        request,
+    )
+    await db.commit()
+    return ok(admin_order_out(order, user))
+
+
+@router.post("/orders/{order_no}/complete", summary="确认完成订单（已发货 → 已完成）")
+async def complete_order(
+    order_no: str,
+    request: Request,
+    admin: Admin = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_order_write(admin)
+    order = await _get_order(db, order_no)
+    if order.status != "已发货":
+        return fail(1001, "仅已发货订单可以完成")
+    order.status = "已完成"
+    order.completed_at = datetime.now()
+    _order_log(db, order_no, "complete", "确认收货，订单完成（已发货 → 已完成）", admin, request)
+    await db.commit()
+    return ok(admin_order_out(order, await db.get(User, order.user_id)))
+
+
+@router.delete("/orders/{order_no}", summary="删除订单（同步清理订单日志，记录操作日志）")
+async def delete_order(
+    order_no: str,
+    request: Request,
+    admin: Admin = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """删除订单：不可恢复，且删除不会自动退款（需先走退款流程）。
+
+    同步清理该订单的订单操作日志，并在全局操作日志中留痕。
+    """
+    _require_order_write(admin)
+    order = await _get_order(db, order_no)
+    detail = (
+        f"删除订单 {order.order_no}（{order.status}）："
+        f"{order.goods_name} × {order.qty}，实付 ¥{order.pay_amount}"
+    )
+    await db.delete(order)
+    logs = (await db.scalars(select(OrderLog).where(OrderLog.order_no == order_no))).all()
+    for log in logs:
+        await db.delete(log)
+    oplog.add_log(
+        db,
+        action="order.delete",
+        admin=admin,
+        target=order_no,
+        detail=detail,
+        ip=_admin_ip(request),
+    )
+    await db.commit()
+    return ok()

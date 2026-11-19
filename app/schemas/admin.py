@@ -5,7 +5,7 @@
 
 from pydantic import BaseModel, Field, field_validator
 
-from .schemas import _check_phone
+from .schemas import _check_phone, mask_phone
 
 
 def _check_phone_optional(v: str | None) -> str | None:
@@ -180,10 +180,58 @@ class CacheBatchIn(BaseModel):
 
 
 class CacheRulesIn(BaseModel):
-    """缓存过期规则入参：城市等级 / 数据精度两维 TTL（秒）。"""
+    """缓存有效期规则入参：天气 / 鱼情 TTL（秒），默认 3 小时。"""
 
-    cityLevels: dict[str, int] = Field(default_factory=dict)
-    precisions: dict[str, int] = Field(default_factory=dict)
+    weather: int = Field(default=10800, ge=60)
+    fish: int = Field(default=10800, ge=60)
+
+
+# ---------------- 订单管理 ----------------
+class OrderShipIn(BaseModel):
+    """发货：录入物流公司 / 单号，可选覆盖配送方式。"""
+
+    logisticsCompany: str
+    logisticsNo: str
+    deliveryType: str | None = None
+
+    @field_validator("logisticsCompany", "logisticsNo")
+    @classmethod
+    def _v_not_empty(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("物流公司与运单号不能为空")
+        return v[:64]
+
+
+class OrderAddressIn(BaseModel):
+    """修改收货地址（已发货订单也可修改）。"""
+
+    receiver: str
+    receiverPhone: str
+    address: str
+
+    @field_validator("receiver", "receiverPhone", "address")
+    @classmethod
+    def _v_not_empty(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("收货人、电话与地址不能为空")
+        return v[:255]
+
+
+class OrderRemarkIn(BaseModel):
+    """订单备注 / 异常标记。"""
+
+    remark: str | None = None
+    abnormal: bool | None = None
+
+
+class OrderRefundIn(BaseModel):
+    """退款 / 部分退款处理：approve=false 表示驳回申请。"""
+
+    amount: float = Field(default=0, ge=0)
+    reason: str | None = None
+    approve: bool = True
 
 
 # ---------------- 响应序列化 ----------------
@@ -333,3 +381,91 @@ def membership_order_admin_out(order, user_name: str | None = None) -> dict:
         "status": order.status,
         "date": order.created_at.strftime("%Y-%m-%d %H:%M") if order.created_at else "",
     }
+
+
+# ---------------- 订单管理 ----------------
+def _dt(dt, fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+    """时间格式化；空值统一返回空串，由前端展示为「--」。"""
+    return dt.strftime(fmt) if dt else ""
+
+
+def _pay_status(order) -> str:
+    """由订单状态推导支付状态：待支付=未支付，已关闭未支付单=已关闭，其余=已支付。"""
+    if order.status == "待支付":
+        return "未支付"
+    if order.status == "已关闭":
+        return "已关闭"
+    if order.refund_amount and order.status in ("已退款", "部分退款"):
+        return "已退款"
+    return "已支付"
+
+
+def admin_order_out(order, user=None, goods=None) -> dict:
+    """订单列表出参：订单核心字段 + 用户 / 商品摘要。"""
+    return {
+        "no": order.order_no,
+        "userId": order.user_id,
+        "uid": getattr(user, "uid", None) or "",
+        "user": getattr(user, "nickname", None) or "—",
+        "userAvatar": getattr(user, "avatar_text", None) or "钓",
+        "userPhone": mask_phone(getattr(user, "phone", None)) or "—",
+        "goodsId": order.goods_id or "",
+        "goods": order.goods_name or "—",
+        "goodsImg": getattr(goods, "img", None),
+        "qty": order.qty,
+        "total": round(order.total or 0, 2),
+        "usePoints": order.use_points or 0,
+        "amount": round(order.pay_amount or 0, 2),
+        "payMethod": order.pay_method or "—",
+        "payStatus": _pay_status(order),
+        "status": order.status,
+        "deliveryType": order.delivery_type or "—",
+        "receiver": order.receiver or "",
+        "receiverPhone": order.receiver_phone or "",
+        "address": order.address or "",
+        "logisticsCompany": order.logistics_company or "",
+        "logisticsNo": order.logistics_no or "",
+        "refundAmount": round(order.refund_amount or 0, 2),
+        "refundStatus": order.refund_status or "none",
+        "refundReason": order.refund_reason or "",
+        "abnormal": bool(order.abnormal),
+        "remark": order.remark or "",
+        "createdAt": _dt(order.created_at),
+        "paidAt": _dt(order.paid_at),
+        "shippedAt": _dt(order.shipped_at),
+        "completedAt": _dt(order.completed_at),
+        "closedAt": _dt(order.closed_at),
+    }
+
+
+def admin_order_detail_out(order, user=None, goods=None, logs=None) -> dict:
+    """订单详情出参：列表字段 + 商品明细 / 用户 / 操作日志。"""
+    data = admin_order_out(order, user, goods)
+    price = getattr(goods, "price", None)
+    data["goodsDetail"] = {
+        "id": order.goods_id or "",
+        "name": order.goods_name or "—",
+        "cat": getattr(goods, "cat", None) or "—",
+        "img": getattr(goods, "img", None),
+        "spec": getattr(goods, "spec", None) or "—",
+        "price": round(price, 2) if price is not None else round(order.total / (order.qty or 1), 2),
+        "qty": order.qty,
+        "subtotal": round(order.total or 0, 2),
+    }
+    data["userInfo"] = {
+        "uid": getattr(user, "uid", None) or "",
+        "nickname": getattr(user, "nickname", None) or "—",
+        "phone": mask_phone(getattr(user, "phone", None)) or "—",
+        "city": getattr(user, "city", None) or "—",
+        "isMember": bool(getattr(user, "is_member", False)),
+    }
+    data["logs"] = [
+        {
+            "action": log.action,
+            "operator": log.operator,
+            "detail": log.detail or "",
+            "createdAt": _dt(log.created_at),
+        }
+        for log in (logs or [])
+    ]
+    return data

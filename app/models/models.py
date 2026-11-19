@@ -202,7 +202,45 @@ class Order(Base):
     use_points = Column(Integer, nullable=False, default=0)
     pay_amount = Column(Float, nullable=False, default=0)
     status = Column(String(16), nullable=False, default="待发货")
+
+    # ---- 支付 / 配送 / 收货（管理后台订单管理） ----
+    pay_method = Column(String(16), nullable=False, default="微信支付")
+    delivery_type = Column(String(16), nullable=False, default="快递")
+    receiver = Column(String(32))
+    receiver_phone = Column(String(32))
+    address = Column(String(255))
+    logistics_company = Column(String(32))
+    logistics_no = Column(String(64))
+    # ---- 运营备注 / 异常标记 / 退款 ----
+    remark = Column(Text)
+    abnormal = Column(Boolean, nullable=False, default=False)
+    refund_amount = Column(Float, nullable=False, default=0)
+    refund_status = Column(String(16), nullable=False, default="none")
+    refund_reason = Column(Text)
+    # ---- 状态时间戳 ----
+    paid_at = Column(DateTime)
+    shipped_at = Column(DateTime)
+    completed_at = Column(DateTime)
+    closed_at = Column(DateTime)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     created_at = Column(DateTime, default=datetime.now)
+
+
+class OrderLog(Base):
+    """订单操作日志：记录每一次后台/系统对订单的操作，用于订单详情全链路追溯。
+
+    order_no 与订单号关联（不使用外键，便于订单归档后仍保留日志）。
+    """
+
+    __tablename__ = "order_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    order_no = Column(String(32), nullable=False, index=True)
+    # 动作：create / pay / close / ship / address / remark / refund / complete
+    action = Column(String(32), nullable=False, default="")
+    operator = Column(String(64), nullable=False, default="系统")
+    detail = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
 
 
 class MembershipOrder(Base):
@@ -264,26 +302,74 @@ class Favorite(Base):
     user = relationship("User", back_populates="favorites")
 
 
+class UserAddress(Base):
+    """用户收货地址簿（小程序端地址管理 + 支付前选择）。"""
+
+    __tablename__ = "user_addresses"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    receiver = Column(String(32), nullable=False)
+    phone = Column(String(32), nullable=False)
+    province = Column(String(32), nullable=False)
+    city = Column(String(32), nullable=False)
+    district = Column(String(64), nullable=False)
+    detail = Column(String(255), nullable=False)
+    # 是否默认地址：同一用户最多一条为 True（业务层保证）
+    is_default = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
 class WeatherCache(Base):
-    """天气 + 鱼情研判缓存：同一地区同一天只让大模型算一次"""
+    """天气数据缓存：同一标准地址 + 同一天 3 小时内只调用一次上游天气源"""
 
     __tablename__ = "weather_cache"
     __table_args__ = (UniqueConstraint("region", "day", name="uq_weather_region_day"),)
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    # 地区（城市名，如「杭州市」；无定位时用「默认」）
-    region = Column(String(32), nullable=False, index=True)
+    # 缓存键：标准化地址 + 查询日期（同一地址同一天精准匹配）
+    cache_key = Column(String(160), nullable=True, index=True)
+    # 标准化地址（如「安徽省 合肥市 蜀山区」；无定位时用「默认」）
+    region = Column(String(64), nullable=False, index=True)
     # 查询日期 YYYY-MM-DD
     day = Column(String(16), nullable=False)
-    # 大模型产出的 weather / verdict / slots 完整快照
+    # 天气观测快照（weather 结构，鱼情分析单独缓存）
     payload = Column(JSON, nullable=False)
     # 数据来源：qweather / llm / fallback
     source = Column(String(16), nullable=False, default="llm")
-    # 过期时间（由缓存过期规则按地区等级/精度计算）
+    # 过期时间（统一 3 小时有效期）
     expire_at = Column(DateTime, nullable=True)
     # 缓存占用字节数（payload 序列化后估算）
     size_bytes = Column(Integer, nullable=False, default=0)
     # 命中次数（命中缓存返回的次数）
+    hit_count = Column(Integer, nullable=False, default=0)
+    # 最近一次命中时间
+    last_hit_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.now)
+
+
+class FishCache(Base):
+    """鱼情分析缓存：相同查询参数 3 小时内只调用一次大模型"""
+
+    __tablename__ = "fish_cache"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # 缓存键：全部查询参数规范化 JSON 的 SHA-256
+    cache_key = Column(String(96), nullable=False, unique=True, index=True)
+    # 标准化地址（供后台列表展示 / 搜索）
+    region = Column(String(64), nullable=False, default="默认", index=True)
+    # 查询参数快照（省/市/区/日期/地点等，供后台查看与排查）
+    params = Column(JSON, nullable=True)
+    # 大模型 / 规则引擎产出的 verdict + slots 快照
+    payload = Column(JSON, nullable=False)
+    # 数据来源：llm / rule
+    source = Column(String(16), nullable=False, default="llm")
+    # 过期时间（统一 3 小时有效期）
+    expire_at = Column(DateTime, nullable=True)
+    # 缓存占用字节数
+    size_bytes = Column(Integer, nullable=False, default=0)
+    # 命中次数
     hit_count = Column(Integer, nullable=False, default=0)
     # 最近一次命中时间
     last_hit_at = Column(DateTime, nullable=True)

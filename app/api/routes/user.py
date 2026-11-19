@@ -6,7 +6,7 @@
 """
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...core.config import settings
@@ -14,23 +14,30 @@ from ...core.deps import get_current_user_id, get_db
 from ...core.response import fail, ok
 from ...core.utils import add_days, gen_no, today
 from ...models import (
+    City,
+    District,
     Favorite,
+    Goods,
     MembershipOrder,
     Order,
     Plan,
     PointsLog,
+    Province,
     Spot,
     SpotComment,
     User,
+    UserAddress,
 )
 from ...schemas.schemas import (
+    AddressIn,
     FavoriteIn,
     LocationIn,
     MembershipIn,
     ProfileIn,
+    address_out,
     membership_order_out,
-    order_out,
     spot_out,
+    user_order_out,
     user_out,
 )
 
@@ -106,6 +113,166 @@ async def set_location(
     return ok(user.location)
 
 
+@router.get("/addresses", summary="收货地址列表（默认地址置顶）")
+async def list_addresses(
+    user_id: int = Depends(get_current_user_id), db: AsyncSession = Depends(get_db)
+):
+    rows = await db.scalars(
+        select(UserAddress)
+        .where(UserAddress.user_id == user_id)
+        .order_by(UserAddress.is_default.desc(), UserAddress.id.desc())
+    )
+    return ok([address_out(a) for a in rows.all()])
+
+
+@router.get("/addresses/{address_id}", summary="收货地址详情")
+async def get_address(
+    address_id: int,
+    user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    return ok(address_out(await _own_address(db, user_id, address_id)))
+
+
+@router.post("/addresses", summary="新增收货地址")
+async def create_address(
+    payload: AddressIn,
+    user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    count = await db.scalar(
+        select(func.count()).select_from(UserAddress).where(UserAddress.user_id == user_id)
+    ) or 0
+    if count >= 20:
+        return fail(1001, "最多保存 20 条收货地址")
+    if not await _valid_region(db, payload.province, payload.city, payload.district):
+        return fail(1001, "省 / 市 / 区信息不合法，请重新选择")
+
+    # 首条地址自动设为默认
+    is_default = payload.isDefault or count == 0
+    if is_default:
+        await _clear_default(db, user_id)
+
+    address = UserAddress(
+        user_id=user_id,
+        receiver=payload.receiver,
+        phone=payload.phone,
+        province=payload.province,
+        city=payload.city,
+        district=payload.district,
+        detail=payload.detail,
+        is_default=is_default,
+    )
+    db.add(address)
+    await db.commit()
+    await db.refresh(address)
+    return ok(address_out(address))
+
+
+@router.put("/addresses/{address_id}", summary="编辑收货地址")
+async def update_address(
+    address_id: int,
+    payload: AddressIn,
+    user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    address = await _own_address(db, user_id, address_id)
+    if not await _valid_region(db, payload.province, payload.city, payload.district):
+        return fail(1001, "省 / 市 / 区信息不合法，请重新选择")
+    if payload.isDefault:
+        await _clear_default(db, user_id)
+
+    address.receiver = payload.receiver
+    address.phone = payload.phone
+    address.province = payload.province
+    address.city = payload.city
+    address.district = payload.district
+    address.detail = payload.detail
+    address.is_default = bool(payload.isDefault)
+
+    await db.commit()
+    await db.refresh(address)
+    return ok(address_out(address))
+
+
+@router.post("/addresses/{address_id}/default", summary="设为默认地址")
+async def set_default_address(
+    address_id: int,
+    user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    address = await _own_address(db, user_id, address_id)
+    await _clear_default(db, user_id)
+    address.is_default = True
+    await db.commit()
+    await db.refresh(address)
+    return ok(address_out(address))
+
+
+@router.delete("/addresses/{address_id}", summary="删除收货地址（默认地址删除后自动顺延）")
+async def delete_address(
+    address_id: int,
+    user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    address = await _own_address(db, user_id, address_id)
+    was_default = bool(address.is_default)
+    await db.delete(address)
+    await db.flush()
+
+    new_default_id = None
+    if was_default:
+        # 删除的是默认地址：自动把剩余地址中的第一条设为默认
+        first = await db.scalar(
+            select(UserAddress)
+            .where(UserAddress.user_id == user_id)
+            .order_by(UserAddress.id.asc())
+            .limit(1)
+        )
+        if first:
+            first.is_default = True
+            new_default_id = first.id
+    await db.commit()
+    return ok({"deleted": address_id, "defaultId": new_default_id})
+
+
+async def _own_address(db: AsyncSession, user_id: int, address_id: int) -> UserAddress:
+    address = await db.scalar(
+        select(UserAddress).where(
+            UserAddress.id == address_id, UserAddress.user_id == user_id
+        )
+    )
+    if not address:
+        raise HTTPException(status_code=404, detail="收货地址不存在")
+    return address
+
+
+async def _clear_default(db: AsyncSession, user_id: int) -> None:
+    await db.execute(
+        update(UserAddress)
+        .where(UserAddress.user_id == user_id, UserAddress.is_default.is_(True))
+        .values(is_default=False)
+    )
+
+
+async def _valid_region(db: AsyncSession, province: str, city: str, district: str) -> bool:
+    """校验省 / 市 / 区三级行政区划是否存在。
+
+    政务/测试库未导入行政区划数据时跳过校验（避免阻断主流程）。
+    """
+    total = await db.scalar(select(func.count()).select_from(Province)) or 0
+    if total == 0:
+        return True
+    p = await db.scalar(select(Province).where(Province.name == province))
+    if not p:
+        return False
+    c = await db.scalar(select(City).where(City.province_id == p.id, City.name == city))
+    if not c:
+        return False
+    d = await db.scalar(select(District).where(District.city_id == c.id, District.name == district))
+    return d is not None
+
+
 @router.get("/favorites", summary="我的收藏野塘")
 async def favorites(
     user_id: int = Depends(get_current_user_id), db: AsyncSession = Depends(get_db)
@@ -172,7 +339,54 @@ async def my_orders(
     rows = await db.scalars(
         select(Order).where(Order.user_id == user_id).order_by(Order.id.desc())
     )
-    return ok([order_out(o) for o in rows.all()])
+    orders = list(rows.all())
+    # 批量取商品信息（图片 / 分类 / 规格），避免 N+1
+    goods_ids = {o.goods_id for o in orders if o.goods_id}
+    goods_map: dict[str, Goods] = {}
+    if goods_ids:
+        goods_rows = (await db.scalars(select(Goods).where(Goods.id.in_(goods_ids)))).all()
+        goods_map = {g.id: g for g in goods_rows}
+    return ok([user_order_out(o, goods_map.get(o.goods_id)) for o in orders])
+
+
+@router.get("/orders/{order_no}", summary="订单详情（小程序端）")
+async def my_order_detail(
+    order_no: str,
+    user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """仅允许查看自己的订单；返回商品、金额、收货与物流摘要。"""
+    order = await db.scalar(
+        select(Order).where(Order.order_no == order_no, Order.user_id == user_id)
+    )
+    if not order:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    goods = await db.get(Goods, order.goods_id) if order.goods_id else None
+    return ok(user_order_out(order, goods))
+
+
+@router.get("/orders/{order_no}/logistics", summary="订单物流信息（公司 / 单号 / 官方电话）")
+async def my_order_logistics(
+    order_no: str,
+    user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """物流信息刷新接口：只返回物流公司、运单号与官方查询电话，不含轨迹节点。"""
+    order = await db.scalar(
+        select(Order).where(Order.order_no == order_no, Order.user_id == user_id)
+    )
+    if not order:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    data = user_order_out(order)
+    return ok(
+        {
+            "company": data["logisticsCompany"],
+            "no": data["logisticsNo"],
+            "phone": data["logisticsPhone"],
+            "deliveryType": data["deliveryType"],
+            "shippedAt": data["shippedAt"],
+        }
+    )
 
 
 @router.get("/comments", summary="我的评论")

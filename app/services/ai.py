@@ -292,30 +292,21 @@ def limit_by_distance(spots: list, near_km: float = NEAR_KM, far_limit: int = FA
 
 # ---------------- 大模型研判（鱼情评分） ----------------
 
-# 同一「地点 + 日期」只问一次模型，避免重复计费与响应抖动；缓存结构化研判结论
-_verdict_cache: dict[str, dict] = {}
-
-
 async def judge_weather(data: dict, day_label: str = "今天") -> dict:
     """基于真实天气数据做鱼情智能评分（0-100），写入 verdict 并同步时段概率。
 
     - 大模型可用：结构化天气上下文注入 LLM，结合鱼类行为学规律推理；失败回退规则引擎；
     - 无论哪条路径，结果都包含：总分、4 维度分项得分与依据、适宜鱼种、总体依据、出钓建议；
     - verdict 的 level/name/rank 仍按确定性映射（verdict_of）从总分推导，保证与前端契约一致。
+    - 防重复调用由上层 cache_store 的 3 小时鱼情缓存负责，本函数每次调用都会真实研判。
     """
     weather = data.get("weather") or {}
     place = weather.get("place")
     date_str = (weather.get("updated") or "")[:10]
-    cache_key = f"{place}|{date_str}"
 
-    cached = _verdict_cache.get(cache_key)
-    if cached is None:
-        judged = await verdict.judge(weather, place, date_str, day_label)
-        cached = judged
-        _verdict_cache[cache_key] = judged
-
-    result = cached["result"]
-    ai_generated = cached.get("aiGenerated", False)
+    judged = await verdict.judge(weather, place, date_str, day_label)
+    result = judged["result"]
+    ai_generated = judged.get("aiGenerated", False)
 
     v = data.setdefault("verdict", {})
     lv = verdict_of(result["score"])

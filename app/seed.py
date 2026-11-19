@@ -15,7 +15,19 @@ from .core.config import settings
 from .core.database import Base, SessionLocal, engine
 from .core.security import hash_password
 from .core.utils import today
-from .models import Admin, AppConfig, City, District, Goods, Order, Plan, Province, User, WeatherLog
+from .models import (
+    Admin,
+    AppConfig,
+    City,
+    District,
+    Goods,
+    Order,
+    OrderLog,
+    Plan,
+    Province,
+    User,
+    WeatherLog,
+)
 from .seed_data import GOODS, PLANS, PROVINCES
 from .services import ai, config_service
 
@@ -101,32 +113,98 @@ async def _seed_demo_user(db: AsyncSession) -> None:
     db.add(user)
     await db.flush()
 
-    db.add(
-        Order(
-            order_no="F20261103008",
+    # 演示订单：覆盖待支付 / 待发货 / 已发货 / 已完成 四种状态，便于后台订单管理开箱可用
+    today_date = date.today()
+    demo_orders = [
+        {
+            "order_no": "F20261103008",
+            "goods_id": "g3",
+            "goods_name": "五谷诱综合钓饵 500g",
+            "qty": 1,
+            "total": 19.9,
+            "use_points": 120,
+            "pay_amount": 19.1,
+            "status": "待发货",
+            "pay_method": "微信支付",
+            "delivery_type": "快递",
+            "receiver": "张先生",
+            "receiver_phone": settings.demo_phone,
+            "address": "浙江省杭州市西湖区王家村 3 组 12 号",
+            "days_ago": 1,
+        },
+        {
+            "order_no": "F20261029021",
+            "goods_id": "g3",
+            "goods_name": "五谷诱钓饵料 500g",
+            "qty": 1,
+            "total": 12.9,
+            "use_points": 0,
+            "pay_amount": 12.9,
+            "status": "已完成",
+            "pay_method": "微信支付",
+            "delivery_type": "快递",
+            "receiver": "张先生",
+            "receiver_phone": settings.demo_phone,
+            "address": "浙江省杭州市西湖区王家村 3 组 12 号",
+            "logistics_company": "顺丰速运",
+            "logistics_no": "SF1234567890123",
+            "days_ago": 6,
+        },
+        {
+            "order_no": "F20261115003",
+            "goods_id": "g1",
+            "goods_name": "碳素轻量台钓竿 4.5m",
+            "qty": 1,
+            "total": 199.0,
+            "use_points": 1500,
+            "pay_amount": 189.0,
+            "status": "待支付",
+            "pay_method": "微信支付",
+            "delivery_type": "快递",
+            "receiver": "张先生",
+            "receiver_phone": settings.demo_phone,
+            "address": "浙江省杭州市西湖区王家村 3 组 12 号",
+            "days_ago": 0,
+        },
+        {
+            "order_no": "F20261112009",
+            "goods_id": "g6",
+            "goods_name": "强光夜钓灯 充电式",
+            "qty": 1,
+            "total": 79.0,
+            "use_points": 0,
+            "pay_amount": 79.0,
+            "status": "已发货",
+            "pay_method": "微信支付",
+            "delivery_type": "快递",
+            "receiver": "张先生",
+            "receiver_phone": settings.demo_phone,
+            "address": "浙江省杭州市西湖区王家村 3 组 12 号",
+            "logistics_company": "中通快递",
+            "logistics_no": "ZT9876543210987",
+            "days_ago": 3,
+        },
+    ]
+    for o in demo_orders:
+        created = datetime.combine(today_date - timedelta(days=o.pop("days_ago")), time(10, 30))
+        order = Order(
             user_id=user.id,
-            goods_id="g3",
-            goods_name="五谷诱综合钓饵 500g",
-            qty=1,
-            total=19.9,
-            use_points=120,
-            pay_amount=19.1,
-            status="待发货",
+            paid_at=None if o["status"] == "待支付" else created,
+            shipped_at=created if o["status"] in ("已发货", "已完成") else None,
+            completed_at=created if o["status"] == "已完成" else None,
+            created_at=created,
+            **o,
         )
-    )
-    db.add(
-        Order(
-            order_no="F20261029021",
-            user_id=user.id,
-            goods_id="g3",
-            goods_name="五谷诱钓饵料 500g",
-            qty=1,
-            total=12.9,
-            use_points=0,
-            pay_amount=12.9,
-            status="已完成",
+        db.add(order)
+        db.add(
+            OrderLog(
+                order_no=o["order_no"],
+                action="create",
+                operator=user.nickname,
+                detail=f"用户下单：{o['goods_name']} × {o['qty']}，实付 ¥{o['pay_amount']}",
+                created_at=created,
+            )
         )
-    )
     await db.commit()
 
 
@@ -288,6 +366,43 @@ def _ensure_columns(sync_conn) -> None:
         sync_conn.execute(sa.text("ALTER TABLE spots ADD COLUMN created_at DATETIME"))
         sync_conn.execute(
             sa.text("UPDATE spots SET created_at=refreshed_at WHERE created_at IS NULL")
+        )
+
+    # 订单管理扩展字段（支付 / 配送 / 收货 / 备注 / 退款 / 状态时间戳）
+    cols = {c["name"] for c in insp.get_columns("orders")}
+    order_columns = {
+        "pay_method": "VARCHAR(16) NOT NULL DEFAULT '微信支付'",
+        "delivery_type": "VARCHAR(16) NOT NULL DEFAULT '快递'",
+        "receiver": "VARCHAR(32)",
+        "receiver_phone": "VARCHAR(32)",
+        "address": "VARCHAR(255)",
+        "logistics_company": "VARCHAR(32)",
+        "logistics_no": "VARCHAR(64)",
+        "remark": "TEXT",
+        "abnormal": "TINYINT(1) NOT NULL DEFAULT 0",
+        "refund_amount": "FLOAT NOT NULL DEFAULT 0",
+        "refund_status": "VARCHAR(16) NOT NULL DEFAULT 'none'",
+        "refund_reason": "TEXT",
+        "paid_at": "DATETIME",
+        "shipped_at": "DATETIME",
+        "completed_at": "DATETIME",
+        "closed_at": "DATETIME",
+        "updated_at": "DATETIME",
+    }
+    for name, ddl in order_columns.items():
+        if name not in cols:
+            sync_conn.execute(sa.text(f"ALTER TABLE orders ADD COLUMN {name} {ddl}"))
+
+    # 天气缓存键（标准化地址 + 日期）
+    cols = {c["name"] for c in insp.get_columns("weather_cache")}
+    if "cache_key" not in cols:
+        sync_conn.execute(sa.text("ALTER TABLE weather_cache ADD COLUMN cache_key VARCHAR(160)"))
+
+    # 鱼情缓存标准化地址（供后台搜索）
+    cols = {c["name"] for c in insp.get_columns("fish_cache")}
+    if "region" not in cols:
+        sync_conn.execute(
+            sa.text("ALTER TABLE fish_cache ADD COLUMN region VARCHAR(64) NOT NULL DEFAULT '默认'")
         )
 
 

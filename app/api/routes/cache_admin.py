@@ -1,10 +1,11 @@
-"""cache_admin.py — 管理后台：天气缓存全生命周期管理（/admin/cache/*）
+"""cache_admin.py — 管理后台：天气 / 鱼情缓存全生命周期管理（/admin/cache/*）
 
 功能：
-- 列表分页 + 多条件筛选（时间范围 / 城市 / 状态 / 数据来源）
+- 天气数据缓存：列表分页 + 多条件筛选（时间范围 / 地址 / 状态 / 来源）
+- 鱼情分析缓存：列表分页 + 多条件筛选（时间范围 / 参数 / 状态 / 来源）
 - 详情查看完整缓存内容
-- 手动刷新（单条 / 批量）、手动删除（单条 / 批量）
-- 过期规则配置（城市等级 / 数据精度差异化 TTL）
+- 手动刷新天气（单条 / 批量）、手动删除（天气 / 鱼情，单条 / 批量）
+- 缓存有效期规则配置（天气 / 鱼情，默认 3 小时）
 - 统计看板（总数 / 占用空间 / 命中率 / 近 7 天趋势 / 即将过期）
 - 高危操作（刷新 / 删除 / 规则修改）仅超级管理员，操作全程留痕
 """
@@ -18,10 +19,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...core.deps import get_current_admin, get_db, get_super_admin
 from ...core.response import fail, ok
-from ...core.utils import today
-from ...models import Admin, WeatherCache, WeatherLog
+from ...models import Admin, FishCache, WeatherCache, WeatherLog
 from ...schemas.admin import CacheBatchIn, CacheRulesIn
-from ...services import ai, cache_policy, oplog
+from ...services import cache_policy, cache_store, oplog
 
 router = APIRouter(prefix="/admin/cache", tags=["缓存管理"])
 
@@ -43,34 +43,22 @@ def _admin_ip(request: Request | None) -> str | None:
         return None
 
 
-def _day_label(day: str) -> str:
-    try:
-        delta = (dt.date.fromisoformat(day) - dt.date.fromisoformat(today())).days
-    except ValueError:
-        return day
-    return {0: "今天", 1: "明天", 2: "后天"}.get(delta, day)
-
-
-def _place_parts(data: dict) -> tuple[str | None, str | None, str | None]:
-    """从快照 payload 解析省/市/区（依据 weather.place 的空格拼接）。"""
-    place = str(((data or {}).get("weather") or {}).get("place") or "")
-    parts = [p for p in place.split() if p]
-    while len(parts) < 3:
-        parts.append("")
-    return parts[0] or None, parts[1] or None, parts[2] or None
-
-
 def _fmt(ts) -> str | None:
     return ts.strftime("%Y-%m-%d %H:%M:%S") if ts else None
 
 
+def _status_of(expire_at, now: dt.datetime) -> str:
+    return "expired" if (expire_at is not None and expire_at < now) else "active"
+
+
 def _cache_out(row: WeatherCache) -> dict:
+    """天气缓存条目（对外结构，供后台列表 / 详情）。"""
     now = dt.datetime.now()
-    expired = bool(row.expire_at) and row.expire_at < now
     w = (row.payload or {}).get("weather") or {}
     return {
+        "type": "weather",
         "id": row.id,
-        "cacheKey": f"{row.region}/{row.day}",
+        "cacheKey": row.cache_key or f"{row.region}|{row.day}",
         "region": row.region,
         "day": row.day,
         "source": row.source,
@@ -80,14 +68,42 @@ def _cache_out(row: WeatherCache) -> dict:
         "sizeBytes": row.size_bytes or 0,
         "sizeKb": round((row.size_bytes or 0) / 1024, 2),
         "hitCount": row.hit_count or 0,
-        "status": "expired" if expired else "active",
+        "status": _status_of(row.expire_at, now),
         "condition": w.get("condition"),
         "temp": w.get("temp"),
     }
 
 
-# ---------------- 列表 / 详情 ----------------
-@router.get("", summary="缓存列表（分页 + 时间/城市/状态/来源筛选）")
+def _fish_out(row: FishCache) -> dict:
+    """鱼情缓存条目（对外结构，供后台列表 / 详情）。"""
+    now = dt.datetime.now()
+    payload = row.payload or {}
+    params = row.params or {}
+    v = payload.get("verdict") or {}
+    return {
+        "type": "fish",
+        "id": row.id,
+        "cacheKey": row.cache_key,
+        "region": row.region or params.get("place") or "默认",
+        "day": params.get("date"),
+        "params": params,
+        "source": row.source,
+        "createdAt": _fmt(row.created_at),
+        "expireAt": _fmt(row.expire_at),
+        "lastHitAt": _fmt(row.last_hit_at),
+        "sizeBytes": row.size_bytes or 0,
+        "sizeKb": round((row.size_bytes or 0) / 1024, 2),
+        "hitCount": row.hit_count or 0,
+        "status": _status_of(row.expire_at, now),
+        "score": v.get("score"),
+        "verdict": v.get("name"),
+        "level": v.get("level"),
+        "aiGenerated": bool(payload.get("aiGenerated")),
+    }
+
+
+# ---------------- 天气缓存：列表 / 详情 ----------------
+@router.get("", summary="天气缓存列表（分页 + 时间/地址/状态/来源筛选）")
 async def list_cache(
     keyword: str | None = None,
     status: str | None = None,
@@ -104,7 +120,9 @@ async def list_cache(
 
     if keyword and keyword.strip():
         k = f"%{keyword.strip()}%"
-        stmt = stmt.where(WeatherCache.region.like(k))
+        stmt = stmt.where(
+            or_(WeatherCache.region.like(k), WeatherCache.cache_key.like(k))
+        )
     if source and source != "all":
         stmt = stmt.where(WeatherCache.source == source)
     if startDate:
@@ -127,15 +145,63 @@ async def list_cache(
     return ok({"list": [_cache_out(r) for r in rows], "total": total, "page": page, "pageSize": page_size})
 
 
+# ---------------- 鱼情缓存：列表 / 详情 ----------------
+@router.get("/fish", summary="鱼情缓存列表（分页 + 时间/参数/状态/来源筛选）")
+async def list_fish_cache(
+    keyword: str | None = None,
+    status: str | None = None,
+    source: str | None = None,
+    startDate: str | None = None,
+    endDate: str | None = None,
+    page: int = 1,
+    pageSize: int = 10,
+    admin: Admin = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    page, page_size, offset = _page_args(page, pageSize)
+    stmt = select(FishCache)
+
+    if keyword and keyword.strip():
+        k = f"%{keyword.strip()}%"
+        stmt = stmt.where(
+            or_(FishCache.region.like(k), FishCache.cache_key.like(k))
+        )
+    if source and source != "all":
+        stmt = stmt.where(FishCache.source == source)
+    if startDate:
+        stmt = stmt.where(FishCache.created_at >= dt.datetime.fromisoformat(startDate[:10]))
+    if endDate:
+        stmt = stmt.where(
+            FishCache.created_at < dt.datetime.fromisoformat(endDate[:10]) + dt.timedelta(days=1)
+        )
+    now = dt.datetime.now()
+    if status == "active":
+        stmt = stmt.where(or_(FishCache.expire_at.is_(None), FishCache.expire_at > now))
+    elif status == "expired":
+        stmt = stmt.where(FishCache.expire_at.is_not(None), FishCache.expire_at <= now)
+
+    total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    rows = (
+        await db.scalars(stmt.order_by(FishCache.id.desc()).offset(offset).limit(page_size))
+    ).all()
+
+    return ok({"list": [_fish_out(r) for r in rows], "total": total, "page": page, "pageSize": page_size})
+
+
 # ---------------- 统计看板 ----------------
-@router.get("/stats", summary="缓存统计看板")
+@router.get("/stats", summary="缓存统计看板（天气 + 鱼情）")
 async def cache_stats(
     admin: Admin = Depends(get_current_admin), db: AsyncSession = Depends(get_db)
 ):
     now = dt.datetime.now()
-    total = await db.scalar(select(func.count()).select_from(WeatherCache)) or 0
-    total_size = await db.scalar(select(func.coalesce(func.sum(WeatherCache.size_bytes), 0))) or 0
-    expiring = (
+    weather_total = await db.scalar(select(func.count()).select_from(WeatherCache)) or 0
+    fish_total = await db.scalar(select(func.count()).select_from(FishCache)) or 0
+    weather_size = (
+        await db.scalar(select(func.coalesce(func.sum(WeatherCache.size_bytes), 0))) or 0
+    )
+    fish_size = await db.scalar(select(func.coalesce(func.sum(FishCache.size_bytes), 0))) or 0
+
+    expiring_weather = (
         await db.scalar(
             select(func.count())
             .select_from(WeatherCache)
@@ -147,6 +213,21 @@ async def cache_stats(
         )
         or 0
     )
+    expiring_fish = (
+        await db.scalar(
+            select(func.count())
+            .select_from(FishCache)
+            .where(
+                FishCache.expire_at.is_not(None),
+                FishCache.expire_at > now,
+                FishCache.expire_at <= now + dt.timedelta(hours=24),
+            )
+        )
+        or 0
+    )
+
+    total = int(weather_total) + int(fish_total)
+    total_size = int(weather_size) + int(fish_size)
 
     # 近 7 天命中趋势（基于 weather_logs.cache_hit）
     start_day = (now - dt.timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -171,10 +252,12 @@ async def cache_stats(
     return ok(
         {
             "totalCount": total,
-            "totalSizeBytes": int(total_size),
-            "totalSizeKb": round((int(total_size) or 0) / 1024, 2),
+            "weatherCount": int(weather_total),
+            "fishCount": int(fish_total),
+            "totalSizeBytes": total_size,
+            "totalSizeKb": round(total_size / 1024, 2),
             "todayHitRate": round(today_hits * 100 / today_total, 1) if today_total else 0.0,
-            "expiringSoon": expiring,
+            "expiringSoon": int(expiring_weather) + int(expiring_fish),
             "trend": {
                 "days": [(start_day + dt.timedelta(days=i)).strftime("%m-%d") for i in range(7)],
                 "hits": hit,
@@ -184,22 +267,22 @@ async def cache_stats(
     )
 
 
-# ---------------- 过期规则配置 ----------------
-@router.get("/rules", summary="缓存过期规则")
+# ---------------- 缓存有效期规则 ----------------
+@router.get("/rules", summary="缓存有效期规则（天气 / 鱼情，秒）")
 async def get_rules(
     admin: Admin = Depends(get_current_admin), db: AsyncSession = Depends(get_db)
 ):
     return ok(await cache_policy.get_rules(db))
 
 
-@router.put("/rules", summary="保存缓存过期规则")
+@router.put("/rules", summary="保存缓存有效期规则")
 async def save_rules(
     payload: CacheRulesIn,
     request: Request,
     admin: Admin = Depends(get_super_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    rules = {"cityLevels": payload.cityLevels, "precisions": payload.precisions}
+    rules = {"weather": payload.weather, "fish": payload.fish}
     await cache_policy.save_rules(db, rules)
     oplog.add_log(
         db,
@@ -214,7 +297,7 @@ async def save_rules(
 
 
 # ---------------- 手动刷新 / 删除（超级管理员） ----------------
-@router.post("/batch-refresh", summary="批量刷新缓存")
+@router.post("/batch-refresh", summary="批量刷新天气缓存")
 async def batch_refresh(
     payload: CacheBatchIn,
     request: Request,
@@ -227,23 +310,11 @@ async def batch_refresh(
     rows = (await db.scalars(select(WeatherCache).where(WeatherCache.id.in_(ids)))).all()
     refreshed = 0
     for row in rows:
-        province, city, district = _place_parts(row.payload or {})
-        place = " ".join([x for x in (province, city, district) if x])
-        detail = f"{district or city or '当前位置'} · 3 公里范围内"
         try:
-            data, source = await ai.generate_weather_traced(place, detail, row.day)
-            data = await ai.judge_weather(data, _day_label(row.day))
-        except Exception:
+            await cache_store.rebuild_weather(db, row)
+            refreshed += 1
+        except Exception:  # noqa: BLE001
             continue  # 单条失败跳过，不影响批量
-        ttl = await cache_policy.ttl_for(db, province=province, city=city, district=district)
-        row.payload = data
-        row.source = source
-        row.expire_at = dt.datetime.now() + dt.timedelta(seconds=ttl)
-        row.size_bytes = len(json.dumps(data, ensure_ascii=False).encode("utf-8"))
-        row.hit_count = 0
-        row.last_hit_at = None
-        row.created_at = dt.datetime.now()
-        refreshed += 1
 
     oplog.add_log(
         db,
@@ -257,7 +328,7 @@ async def batch_refresh(
     return ok({"refreshed": refreshed})
 
 
-@router.post("/batch-delete", summary="批量删除缓存")
+@router.post("/batch-delete", summary="批量删除天气缓存")
 async def batch_delete(
     payload: CacheBatchIn,
     request: Request,
@@ -282,7 +353,32 @@ async def batch_delete(
     return ok({"deleted": len(rows)})
 
 
-@router.post("/{cache_id}/refresh", summary="刷新单条缓存（拉取最新上游数据）")
+@router.post("/fish/batch-delete", summary="批量删除鱼情缓存")
+async def batch_delete_fish(
+    payload: CacheBatchIn,
+    request: Request,
+    admin: Admin = Depends(get_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    ids = [i for i in (payload.ids or []) if i]
+    if not ids:
+        return fail(1001, "请选择要删除的缓存")
+    rows = (await db.scalars(select(FishCache).where(FishCache.id.in_(ids)))).all()
+    for row in rows:
+        await db.delete(row)
+    oplog.add_log(
+        db,
+        action=oplog.ACTION_CACHE_BATCH_DELETE,
+        admin=admin,
+        target=",".join(str(i) for i in ids[:20]),
+        detail=f"批量删除鱼情缓存 {len(rows)} 条",
+        ip=_admin_ip(request),
+    )
+    await db.commit()
+    return ok({"deleted": len(rows)})
+
+
+@router.post("/{cache_id}/refresh", summary="刷新单条天气缓存（拉取最新上游数据）")
 async def refresh_cache(
     cache_id: int,
     request: Request,
@@ -293,21 +389,7 @@ async def refresh_cache(
     if not row:
         raise _res_404("缓存")
 
-    province, city, district = _place_parts(row.payload or {})
-    place = " ".join([x for x in (province, city, district) if x])
-    detail = f"{district or city or '当前位置'} · 3 公里范围内"
-
-    data, source = await ai.generate_weather_traced(place, detail, row.day)
-    data = await ai.judge_weather(data, _day_label(row.day))
-    ttl = await cache_policy.ttl_for(db, province=province, city=city, district=district)
-
-    row.payload = data
-    row.source = source
-    row.expire_at = dt.datetime.now() + dt.timedelta(seconds=ttl)
-    row.size_bytes = len(json.dumps(data, ensure_ascii=False).encode("utf-8"))
-    row.hit_count = 0
-    row.last_hit_at = None
-    row.created_at = dt.datetime.now()
+    source = await cache_store.rebuild_weather(db, row)
 
     oplog.add_log(
         db,
@@ -321,7 +403,7 @@ async def refresh_cache(
     return ok(_cache_out(row), "缓存已刷新")
 
 
-@router.delete("/{cache_id}", summary="删除单条缓存")
+@router.delete("/{cache_id}", summary="删除单条天气缓存")
 async def delete_cache(
     cache_id: int,
     request: Request,
@@ -346,7 +428,43 @@ async def delete_cache(
 
 
 # ---------------- 详情（动态路由，置于最后避免与 /stats、/rules 等静态路由冲突） ----------------
-@router.get("/{cache_id}", summary="缓存详情（完整天气数据）")
+@router.get("/fish/{fish_id}", summary="鱼情缓存详情（完整分析结果）")
+async def fish_cache_detail(
+    fish_id: int,
+    admin: Admin = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    row = await db.get(FishCache, fish_id)
+    if not row:
+        raise _res_404("缓存")
+    return ok({"cache": _fish_out(row), "payload": row.payload, "params": row.params})
+
+
+@router.delete("/fish/{fish_id}", summary="删除单条鱼情缓存")
+async def delete_fish_cache(
+    fish_id: int,
+    request: Request,
+    admin: Admin = Depends(get_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    row = await db.get(FishCache, fish_id)
+    if not row:
+        raise _res_404("缓存")
+    key = row.cache_key
+    await db.delete(row)
+    oplog.add_log(
+        db,
+        action=oplog.ACTION_CACHE_DELETE,
+        admin=admin,
+        target=str(fish_id),
+        detail=f"删除鱼情缓存 {key}",
+        ip=_admin_ip(request),
+    )
+    await db.commit()
+    return ok()
+
+
+@router.get("/{cache_id}", summary="天气缓存详情（完整天气数据）")
 async def cache_detail(
     cache_id: int,
     admin: Admin = Depends(get_current_admin),

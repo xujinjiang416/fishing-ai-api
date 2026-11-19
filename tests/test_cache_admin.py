@@ -1,6 +1,6 @@
 """tests/test_cache_admin.py — 缓存管理接口测试
 
-覆盖：列表 / 详情 / 状态筛选 / 规则读写 / 统计 / 删除 / 权限拦截（普通管理员 403）。
+覆盖：天气/鱼情缓存列表 / 详情 / 状态筛选 / 规则读写 / 统计 / 删除 / 权限拦截（普通管理员 403）。
 """
 
 from datetime import datetime, timedelta
@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from app.core.security import create_admin_token, hash_password
-from app.models import Admin, WeatherCache
+from app.models import Admin, FishCache, WeatherCache
 
 
 async def _seed_caches(session_factory) -> None:
@@ -67,15 +67,18 @@ async def test_rules_get_and_put(client, admin_headers):
     r = await client.get("/api/admin/cache/rules", headers=admin_headers)
     assert r.status_code == 200
     rules = r.json()["data"]
-    assert "cityLevels" in rules and "precisions" in rules
+    # 默认天气 / 鱼情有效期均为 3 小时
+    assert rules["weather"] == 10800
+    assert rules["fish"] == 10800
 
     r2 = await client.put(
         "/api/admin/cache/rules",
         headers=admin_headers,
-        json={"cityLevels": {"一线": 1800}, "precisions": {"district": 3600}},
+        json={"weather": 7200, "fish": 5400},
     )
     assert r2.status_code == 200
-    assert r2.json()["data"]["cityLevels"]["一线"] == 1800
+    assert r2.json()["data"]["weather"] == 7200
+    assert r2.json()["data"]["fish"] == 5400
 
 
 @pytest.mark.asyncio
@@ -101,6 +104,86 @@ async def test_delete_and_batch_delete(client, session_factory, admin_headers):
     b = await client.post("/api/admin/cache/batch-delete", headers=admin_headers, json={"ids": [ids[1]]})
     assert b.status_code == 200
     assert (await client.get("/api/admin/cache", headers=admin_headers)).json()["data"]["total"] == 0
+
+
+async def _seed_fish_caches(session_factory) -> None:
+    now = datetime.now()
+    async with session_factory() as db:
+        db.add_all(
+            [
+                FishCache(
+                    cache_key="fish:" + "a" * 64,
+                    region="安徽省 合肥市 蜀山区",
+                    params={
+                        "province": "安徽省",
+                        "city": "合肥市",
+                        "district": "蜀山区",
+                        "date": "2026-11-19",
+                        "place": "安徽省 合肥市 蜀山区",
+                    },
+                    payload={
+                        "verdict": {"score": 82, "name": "适合出钓", "level": "good", "advice": "早口打窝"},
+                        "slots": [],
+                        "aiGenerated": True,
+                    },
+                    source="llm",
+                    expire_at=now + timedelta(hours=2),
+                    size_bytes=150,
+                ),
+                FishCache(
+                    cache_key="fish:" + "b" * 64,
+                    region="上海市 黄浦区",
+                    params={"province": "上海市", "district": "黄浦区", "date": "2026-11-19"},
+                    payload={"verdict": {"score": 55, "name": "一般", "level": "fair"}, "slots": []},
+                    source="rule",
+                    expire_at=now - timedelta(hours=1),
+                    size_bytes=90,
+                ),
+            ]
+        )
+        await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_fish_cache_list_detail_and_delete(client, session_factory, admin_headers):
+    await _seed_fish_caches(session_factory)
+
+    r = await client.get("/api/admin/cache/fish", headers=admin_headers)
+    assert r.status_code == 200
+    data = r.json()["data"]
+    assert data["total"] == 2
+
+    expired = await client.get(
+        "/api/admin/cache/fish", headers=admin_headers, params={"status": "expired"}
+    )
+    assert expired.json()["data"]["total"] == 1
+
+    searched = await client.get(
+        "/api/admin/cache/fish", headers=admin_headers, params={"keyword": "合肥"}
+    )
+    assert searched.json()["data"]["total"] == 1
+
+    fid = data["list"][0]["id"]
+    detail = await client.get(f"/api/admin/cache/fish/{fid}", headers=admin_headers)
+    assert detail.status_code == 200
+    assert detail.json()["data"]["payload"]["verdict"]["score"] in (82, 55)
+
+    d = await client.delete(f"/api/admin/cache/fish/{fid}", headers=admin_headers)
+    assert d.status_code == 200
+    assert (
+        await client.get("/api/admin/cache/fish", headers=admin_headers)
+    ).json()["data"]["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_stats_includes_fish_cache(client, session_factory, admin_headers):
+    await _seed_caches(session_factory)
+    await _seed_fish_caches(session_factory)
+    data = (await client.get("/api/admin/cache/stats", headers=admin_headers)).json()["data"]
+    assert data["weatherCount"] == 2
+    assert data["fishCount"] == 2
+    assert data["totalCount"] == 4
+    assert data["totalSizeBytes"] == 300 + 240
 
 
 @pytest.mark.asyncio
@@ -131,6 +214,9 @@ async def test_normal_admin_forbidden(client, session_factory):
     # 查看允许
     assert (await client.get("/api/admin/cache", headers=h)).status_code == 200
     # 高危操作拦截
-    assert (await client.put("/api/admin/cache/rules", headers=h, json={"cityLevels": {}, "precisions": {}})).status_code == 403
+    assert (
+        await client.put("/api/admin/cache/rules", headers=h, json={"weather": 3600, "fish": 3600})
+    ).status_code == 403
     assert (await client.delete("/api/admin/cache/1", headers=h)).status_code == 403
     assert (await client.post("/api/admin/cache/1/refresh", headers=h)).status_code == 403
+    assert (await client.delete("/api/admin/cache/fish/1", headers=h)).status_code == 403
