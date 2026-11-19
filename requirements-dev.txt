@@ -1,0 +1,8 @@
+# 开发/测试依赖（安装：pip install -r requirements-dev.txt）
+# 生产运行仅需 requirements.txt，本文件用于本地跑单元测试与集成测试。
+-r requirements.txt
+
+pytest>=8.0.0
+pytest-asyncio>=0.24.0
+# 测试用 SQLite 内存库驱动（无需本地 MySQL 即可运行测试）
+aiosqlite>=0.20.0
