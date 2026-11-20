@@ -209,7 +209,7 @@ async def snapshot(db: AsyncSession) -> dict:
         dict: camelCase 配置快照（pointsPerYuan/checkin/ad/plans）。
     """
     v = await config_values(db)
-    # 仅返回「上架」的会员套餐，按排序值升序；数据库异常时返回空列表兜底
+    # 仅返回「上架」的会员套餐，按排序权重降序、创建时间降序；数据库异常时返回空列表兜底
     plans = []
     try:
         from ..models import Plan  # 局部导入，避免模块级循环依赖
@@ -218,7 +218,7 @@ async def snapshot(db: AsyncSession) -> dict:
             await db.scalars(
                 select(Plan).where(
                     (Plan.status.is_(None)) | (Plan.status == "on")
-                ).order_by(Plan.sort, Plan.id)
+                ).order_by(Plan.sort.desc(), Plan.created_at.desc(), Plan.id)
             )
         ).all()
         plans = [

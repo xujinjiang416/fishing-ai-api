@@ -46,8 +46,40 @@ def _check_phone(v: str) -> str:
     return v
 
 
+# 用户名：4-16 位，仅允许中文、英文、数字、下划线与短横线（天然排除空格与表情）
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_\-\u4e00-\u9fa5]{4,16}$")
+
+# 表情符号检测：补充平面 Emoji + 常见 BMP 符号 + 变体选择符 / 零宽连接符
+EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D]")
+
+
+def _check_username(v: str) -> str:
+    """用户名校验：4-16 位，禁止空格与表情符号，仅允许中英文 / 数字 / _ / -。
+
+    Args:
+        v: 原始用户名。
+
+    Returns:
+        str: 原样返回合法用户名（不做去空格等隐式修改）。
+
+    Raises:
+        ValueError: 类型错误、长度越界、含空格 / 表情或非法字符。
+    """
+    if not isinstance(v, str):
+        raise ValueError("用户名格式不正确")
+    if any(ch.isspace() for ch in v):
+        raise ValueError("用户名不能包含空格")
+    if EMOJI_RE.search(v):
+        raise ValueError("用户名不能包含表情符号")
+    if not (4 <= len(v) <= 16):
+        raise ValueError("用户名需为 4-16 位字符")
+    if not USERNAME_RE.match(v):
+        raise ValueError("用户名仅支持中英文、数字、下划线和短横线")
+    return v
+
+
 def _check_password(v: str) -> str:
-    """密码校验：必须为字符串且长度在 6-16 位之间。
+    """密码校验：6-16 位，禁止纯空格与表情符号。
 
     Args:
         v: 原始密码。
@@ -56,10 +88,16 @@ def _check_password(v: str) -> str:
         str: 原样返回合法密码（不加密，加密在 security.hash_password）。
 
     Raises:
-        ValueError: 类型不是字符串或长度越界。
+        ValueError: 类型不是字符串、纯空格、含表情或长度越界。
     """
-    if not isinstance(v, str) or not (6 <= len(v) <= 16):
+    if not isinstance(v, str):
+        raise ValueError("密码格式不正确")
+    if not v.strip():
+        raise ValueError("密码不能为纯空格")
+    if not (6 <= len(v) <= 16):
         raise ValueError("密码需为 6-16 位")
+    if EMOJI_RE.search(v):
+        raise ValueError("密码不能包含表情符号")
     return v
 
 
@@ -74,9 +112,9 @@ class WechatLoginIn(BaseModel):
 
 
 class PasswordLoginIn(BaseModel):
-    """账号密码登录：account 必须是手机号，password 为 6-16 位。"""
+    """用户名 + 密码登录：account 为用户名（4-16 位），password 为 6-16 位。"""
 
-    # 登录账号：手机号，由 _check_phone 规范化
+    # 登录账号：用户名（4-16 位，不含空格 / 表情）
     account: str
     # 明文密码：仅用于与库中哈希比对，不落库
     password: str
@@ -84,21 +122,21 @@ class PasswordLoginIn(BaseModel):
     @field_validator("account")
     @classmethod
     def _v_account(cls, v: str) -> str:
-        """校验并规范化登录账号（手机号）。"""
-        return _check_phone(v)
+        """校验登录用户名的长度、字符集与非法内容。"""
+        return _check_username(v)
 
     @field_validator("password")
     @classmethod
     def _v_password(cls, v: str) -> str:
-        """校验登录密码长度（6-16 位）。"""
+        """校验登录密码（6-16 位、非纯空格、不含表情）。"""
         return _check_password(v)
 
 
 class RegisterIn(BaseModel):
-    """注册：手机号 + 密码（6-16 位），confirmPassword 传了就校验一致。"""
+    """注册：用户名 + 密码（6-16 位），confirmPassword 传了就校验一致。"""
 
-    # 注册手机号，同时作为登录账号（唯一）
-    phone: str
+    # 注册用户名，同时作为登录账号（唯一）
+    username: str
     # 明文密码：6-16 位，落库前由 security.hash_password 哈希
     password: str
     # 可选确认密码：仅在传入时校验与 password 一致
@@ -106,16 +144,16 @@ class RegisterIn(BaseModel):
     # 可选昵称：为空时后端使用默认昵称「钓友」
     nickname: str | None = None
 
-    @field_validator("phone")
+    @field_validator("username")
     @classmethod
-    def _v_phone(cls, v: str) -> str:
-        """校验并规范化注册手机号。"""
-        return _check_phone(v)
+    def _v_username(cls, v: str) -> str:
+        """校验并规范化注册用户名。"""
+        return _check_username(v)
 
     @field_validator("password")
     @classmethod
     def _v_password(cls, v: str) -> str:
-        """校验注册密码长度（6-16 位）。"""
+        """校验注册密码（6-16 位、非纯空格、不含表情）。"""
         return _check_password(v)
 
     @field_validator("confirmPassword")
@@ -145,7 +183,8 @@ class ProfileIn(BaseModel):
     nickname: str | None = None
     # 所在城市名称
     city: str | None = None
-    # 手机号（换绑时传入，需通过 _check_phone 校验）
+    # 手机号（预留绑定 / 换绑入口，需通过 _check_phone 校验；
+    # 任何用户资料响应都不回传手机号，仅回传 phoneBound 布尔值）
     phone: str | None = None
 
 
@@ -272,18 +311,28 @@ def mask_phone(phone: str | None) -> str | None:
 def user_out(user) -> dict:
     """用户信息出参（“我的”页 / 登录返回共用）。
 
+    隐私约定：不返回手机号原文或脱敏值，仅返回 username 作为身份标识，
+    以及 phoneBound 布尔值供前端展示绑定状态；手机号仍保留在 users.phone。
+    历史账号若 account 与 phone 相同（早期以手机号注册），username 返回空串，
+    避免把手机号当作用户名变相展示。
+
     Args:
         user: User ORM 对象。
 
     Returns:
-        dict: camelCase 用户资料；手机号已脱敏，checkedToday 由最后签到日期推导。
+        dict: camelCase 用户资料；checkedToday 由最后签到日期推导。
     """
+    account = (user.account or "").strip()
+    phone = (user.phone or "").strip()
+    if account and phone and account == phone:
+        account = ""
     return {
         "id": user.id,
         "uid": user.uid,
+        "username": account,
         "nickname": user.nickname,
         "avatarText": user.avatar_text,
-        "phone": mask_phone(user.phone),
+        "phoneBound": bool(phone),
         "level": user.level,
         "joined": user.joined,
         "city": user.city,

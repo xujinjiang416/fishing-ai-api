@@ -457,7 +457,7 @@ class Plan(Base):
     tag_type = Column(String(16), nullable=False, default="primary")  # 角标配色类型，默认 primary
     sales = Column(Integer, nullable=False, default=0)  # 累计销量（份），默认 0
     status = Column(String(8), nullable=False, default="off")  # 上下架：on=上架 / off=下架，默认 off
-    sort = Column(Integer, nullable=False, default=0)  # 排序权重，升序展示，默认 0
+    sort = Column(Integer, nullable=False, default=0)  # 排序权重：非负整数，越大越靠前，默认 0
     benefits = Column(JSON, nullable=False, default=list)  # 权益说明列表，默认空列表
     created_at = Column(DateTime, default=datetime.now)  # 创建时间
 

@@ -3,7 +3,8 @@
 职责：
 - 建表（create_all）并为已存在的旧库补齐新增列（_ensure_columns）；
 - 清理早期写死的种子钓点（_purge_legacy_spots）；
-- 灌入省市县 / 商品 / 演示用户与演示订单 / 管理员 / 会员套餐 / 天气日志 / 积分配置。
+- 灌入省市县 / 商品 / 管理员 / 会员套餐 / 积分配置等基础数据；
+- 不再创建演示账号与演示业务数据，避免清理后被启动流程重新写回。
 
 执行方式：
 - 命令行：`python -m app.seed`（脚本入口在文件末尾）；
@@ -11,7 +12,7 @@
 
 前置条件：
 - 数据库连接由 `app.core.database` 的 engine / SessionLocal 决定（默认 MySQL，可通过 .env 覆盖）；
-- 演示账号与管理员账号的手机号 / 密码取自 `settings`（demo_phone / demo_password、admin_username / admin_password）。
+- 管理员账号的用户名 / 密码取自 `settings`（admin_username / admin_password）。
 
 注意事项：
 - 所有写入均以「表为空才插入」或「按唯一键查重后补齐」的方式实现，可反复执行；
@@ -20,7 +21,6 @@
 """
 
 import asyncio
-from datetime import date, datetime, time, timedelta
 
 import sqlalchemy as sa
 from sqlalchemy import func, select
@@ -29,25 +29,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .core.config import settings
 from .core.database import Base, SessionLocal, engine
 from .core.security import hash_password
-from .core.utils import today
-from .models import (
-    Admin,
-    AppConfig,
-    City,
-    District,
-    Goods,
-    Order,
-    OrderLog,
-    Plan,
-    Province,
-    User,
-    WeatherLog,
-)
+from .models import Admin, AppConfig, City, District, Goods, Plan, Province
 from .seed_data import GOODS, PLANS, PROVINCES
-from .services import ai, config_service
-
-# 内置演示账号的登录名（users.account）；手机号与密码见 settings.demo_phone / demo_password
-DEMO_ACCOUNT = "demo"
+from .services import config_service
 
 
 async def _count(db: AsyncSession, model) -> int:
@@ -111,151 +95,6 @@ async def _seed_goods(db: AsyncSession) -> None:
     await db.commit()
 
 
-async def _seed_demo_user(db: AsyncSession) -> None:
-    """内置演示账号：用「演示手机号 + 演示密码」直接登录，数据与原型保持一致。
-
-    幂等策略：以 account == "demo" 查重；已存在时只补齐缺失的手机号 / 密码哈希，
-    不覆盖等级、积分等运行期可能被改动的字段。
-
-    账号默认值：手机号 settings.demo_phone（默认 13800138000），
-    密码 settings.demo_password（默认 123456），登录名 demo。
-
-    同时写入 4 笔演示订单，覆盖待支付 / 待发货 / 已发货 / 已完成四种状态，
-    并按 `days_ago` 回推下单时间，保证后台订单看板开箱可用。
-    仅在演示用户首次创建时写入，重复执行不会重复插入。
-    """
-    demo_hash = hash_password(settings.demo_password)
-    existing = await db.scalar(select(User).where(User.account == DEMO_ACCOUNT))
-    if existing:
-        # 保证演示账号可直接用手机号 + 密码登录
-        if existing.phone != settings.demo_phone or not existing.password_hash:
-            existing.phone = settings.demo_phone
-            existing.password_hash = demo_hash
-            await db.commit()
-        return
-
-    user = User(
-        uid="u_88213",
-        account=DEMO_ACCOUNT,
-        nickname="钓王老张",
-        avatar_text="张",
-        phone=settings.demo_phone,
-        password_hash=demo_hash,
-        level="Lv.4 老钓友",
-        city="杭州",
-        joined="2025-08-12",
-        is_member=False,
-        member_expire="2026-12-05",
-        points=990,
-        points_total=1860,
-        streak=4,
-        max_streak=12,
-        last_checkin_date="",
-        ads_date=today(),
-        ads_watched_today=3,
-        ad_points_today=15,
-        location={"province": "浙江省", "city": "杭州市", "district": "西湖区", "source": "manual"},
-    )
-    db.add(user)
-    await db.flush()
-
-    # 演示订单：覆盖待支付 / 待发货 / 已发货 / 已完成 四种状态，便于后台订单管理开箱可用
-    # 字段含义：total 商品总额、use_points 抵扣积分、pay_amount 实付金额（元）、
-    # days_ago 为相对今天回溯的天数（决定 created_at）
-    today_date = date.today()
-    demo_orders = [
-        {
-            "order_no": "F20261103008",
-            "goods_id": "g3",
-            "goods_name": "五谷诱综合钓饵 500g",
-            "qty": 1,
-            "total": 19.9,
-            "use_points": 120,
-            "pay_amount": 19.1,
-            "status": "待发货",
-            "pay_method": "微信支付",
-            "delivery_type": "快递",
-            "receiver": "张先生",
-            "receiver_phone": settings.demo_phone,
-            "address": "浙江省杭州市西湖区王家村 3 组 12 号",
-            "days_ago": 1,
-        },
-        {
-            "order_no": "F20261029021",
-            "goods_id": "g3",
-            "goods_name": "五谷诱钓饵料 500g",
-            "qty": 1,
-            "total": 12.9,
-            "use_points": 0,
-            "pay_amount": 12.9,
-            "status": "已完成",
-            "pay_method": "微信支付",
-            "delivery_type": "快递",
-            "receiver": "张先生",
-            "receiver_phone": settings.demo_phone,
-            "address": "浙江省杭州市西湖区王家村 3 组 12 号",
-            "logistics_company": "顺丰速运",
-            "logistics_no": "SF1234567890123",
-            "days_ago": 6,
-        },
-        {
-            "order_no": "F20261115003",
-            "goods_id": "g1",
-            "goods_name": "碳素轻量台钓竿 4.5m",
-            "qty": 1,
-            "total": 199.0,
-            "use_points": 1500,
-            "pay_amount": 189.0,
-            "status": "待支付",
-            "pay_method": "微信支付",
-            "delivery_type": "快递",
-            "receiver": "张先生",
-            "receiver_phone": settings.demo_phone,
-            "address": "浙江省杭州市西湖区王家村 3 组 12 号",
-            "days_ago": 0,
-        },
-        {
-            "order_no": "F20261112009",
-            "goods_id": "g6",
-            "goods_name": "强光夜钓灯 充电式",
-            "qty": 1,
-            "total": 79.0,
-            "use_points": 0,
-            "pay_amount": 79.0,
-            "status": "已发货",
-            "pay_method": "微信支付",
-            "delivery_type": "快递",
-            "receiver": "张先生",
-            "receiver_phone": settings.demo_phone,
-            "address": "浙江省杭州市西湖区王家村 3 组 12 号",
-            "logistics_company": "中通快递",
-            "logistics_no": "ZT9876543210987",
-            "days_ago": 3,
-        },
-    ]
-    for o in demo_orders:
-        created = datetime.combine(today_date - timedelta(days=o.pop("days_ago")), time(10, 30))
-        order = Order(
-            user_id=user.id,
-            paid_at=None if o["status"] == "待支付" else created,
-            shipped_at=created if o["status"] in ("已发货", "已完成") else None,
-            completed_at=created if o["status"] == "已完成" else None,
-            created_at=created,
-            **o,
-        )
-        db.add(order)
-        db.add(
-            OrderLog(
-                order_no=o["order_no"],
-                action="create",
-                operator=user.nickname,
-                detail=f"用户下单：{o['goods_name']} × {o['qty']}，实付 ¥{o['pay_amount']}",
-                created_at=created,
-            )
-        )
-    await db.commit()
-
-
 async def _seed_admin(db: AsyncSession) -> None:
     """内置管理后台账号（admins 表，与小程序 users 分表）。
 
@@ -306,61 +145,6 @@ async def _seed_plans(db: AsyncSession) -> None:
                 status="on",
                 sort=p["sort"],
                 benefits=p["benefits"],
-            )
-        )
-    await db.commit()
-
-
-# 演示天气日志样本：分数/天气/地点铺满近 7 天，保证看板趋势与列表首屏有数据
-# 每项含义：(鱼情评分 0-100, 天气描述, 气温 ℃, 气压 hPa, 钓点位置描述)
-_SEED_LOGS = [
-    ("86", "多云转晴", 17.0, 1018.6, "王家村后塘 · 3 公里范围内"),
-    ("74", "晴", 19.0, 1016.2, "钱塘江支流 · 3 公里范围内"),
-    ("61", "阴", 16.0, 1013.8, "西溪湿地北门 · 3 公里范围内"),
-    ("45", "小雨", 14.0, 1010.5, "余杭塘河 · 3 公里范围内"),
-    ("90", "多云", 21.0, 1019.4, "王家村后塘 · 3 公里范围内"),
-    ("68", "晴", 18.0, 1017.1, "贴沙河 · 3 公里范围内"),
-    ("52", "阴转多云", 15.0, 1012.3, "铜鉴湖 · 3 公里范围内"),
-    ("79", "多云", 20.0, 1018.0, "钱塘江支流 · 3 公里范围内"),
-]
-
-
-async def _seed_weather_logs(db: AsyncSession) -> None:
-    """写入演示用户的天气查询日志（仅当 weather_logs 表为空时执行）。
-
-    依赖演示账号已存在（account = demo），否则直接返回；
-    按 `_SEED_LOGS` 逐条生成，日期从「今天 - 7 天」连续铺到昨天，
-    评分经 `ai.verdict_of` 换算为等级 / 名称，来源、解锁方式、风力等字段按下标轮换取值，
-    保证后台筛选与图表都有多态样本。重复执行不会重复插入。
-    """
-    if await _count(db, WeatherLog):
-        return
-    demo = await db.scalar(select(User).where(User.account == DEMO_ACCOUNT))
-    if not demo:
-        return
-
-    today_date = date.today()
-    for i, (score, cond, temp, pressure, detail) in enumerate(_SEED_LOGS):
-        d = today_date - timedelta(days=len(_SEED_LOGS) - 1 - i)
-        v = ai.verdict_of(float(score))
-        db.add(
-            WeatherLog(
-                id=f"wx_10{40 + i:03d}",
-                user_id=demo.id,
-                user=demo.nickname,
-                place="浙江省 杭州市 西湖区",
-                place_detail=detail,
-                date=f"{d.isoformat()} 0{6 + i % 4}:{(10 + i * 7) % 60:02d}",
-                score=int(score),
-                verdict=v["name"],
-                level=v["level"],
-                condition=cond,
-                temp=temp,
-                pressure=pressure,
-                wind_diff="东北风 2 级" if i % 2 == 0 else "东南风 3 级",
-                source="手动选点" if i % 3 else "手机定位",
-                cost=["广告解锁", "会员", "¥0.99 单次"][i % 3],
-                created_at=datetime.combine(d, time(6 + i % 2 * 8, (10 + i * 7) % 60)),
             )
         )
     await db.commit()
@@ -512,18 +296,16 @@ async def _seed_configs(db: AsyncSession) -> None:
 async def _seed_all(db: AsyncSession) -> None:
     """按依赖顺序依次执行各数据集种子写入。
 
-    顺序要求：行政区划 / 商品 / 演示用户先落库，天气日志依赖演示用户，
-    套餐与配置相互独立；每步内部自带幂等判断。
+    顺序要求：行政区划 / 商品 / 管理员先落库，套餐与配置相互独立；
+    每步内部自带幂等判断。演示账号与演示业务数据已停止写入。
     """
     await _seed_geo(db)
     await _seed_goods(db)
-    await _seed_demo_user(db)
     await _seed_admin(db)
     await _seed_plans(db)
-    await _seed_weather_logs(db)
     await _seed_configs(db)
 
 
 if __name__ == "__main__":
     asyncio.run(run_seed())
-    print("初始化完成：省市县 / 商品 / 演示账号 / 管理员 / 会员套餐 / 天气日志 / 积分配置")
+    print("初始化完成：省市县 / 商品 / 管理员 / 会员套餐 / 积分配置")

@@ -260,7 +260,7 @@ async def overview(
 
 # ---------------- 用户管理 ----------------
 # 接口：GET /admin/users — 用户列表（需管理员 token）
-# Query：keyword（模糊匹配昵称 / 手机号 / uid）、plan（"all" 不过滤；"none" 表示 plan 为空或 "none"；其余按套餐 id 精确匹配）、
+# Query：keyword（模糊匹配用户名 / 昵称 / 手机号 / uid）、plan（"all" 不过滤；"none" 表示 plan 为空或 "none"；其余按套餐 id 精确匹配）、
 #        status（"all" 不过滤；其余按 User.status 精确匹配）、page（默认 1）、pageSize（默认 10，上限 100）。
 # 响应：分页 {list,total,page,pageSize}，列表项 = admin_user_out + weatherCount（该用户天气查询次数），手机号脱敏。
 # 查询：按 id 倒序；总数与列表复用同一筛选条件（子查询计数）。
@@ -278,7 +278,14 @@ async def list_users(
     stmt = select(User)
     if keyword and keyword.strip():
         k = f"%{keyword.strip()}%"
-        stmt = stmt.where(or_(User.nickname.like(k), User.phone.like(k), User.uid.like(k)))
+        stmt = stmt.where(
+            or_(
+                User.account.like(k),
+                User.nickname.like(k),
+                User.phone.like(k),
+                User.uid.like(k),
+            )
+        )
     if plan and plan != "all":
         stmt = stmt.where(
             or_(User.plan.is_(None), User.plan == "none") if plan == "none" else User.plan == plan
@@ -450,25 +457,28 @@ async def batch_delete_users(
 
 # ---------------- 会员套餐 ----------------
 # 接口：GET /admin/plans — 套餐列表（需管理员 token）
-# 无参数、不分页；返回全部套餐（含下架），按 sort 升序、id 升序；data 为 plan_out 数组。
+# 无参数、不分页；返回全部套餐（含下架），按排序权重降序、创建时间降序、id 升序；data 为 plan_out 数组。
 @router.get("/plans", summary="套餐列表")
 async def list_plans(
     admin: Admin = Depends(get_current_admin), db: AsyncSession = Depends(get_db)
 ):
-    rows = (await db.scalars(select(Plan).order_by(Plan.sort, Plan.id))).all()
+    rows = (
+        await db.scalars(
+            select(Plan).order_by(Plan.sort.desc(), Plan.created_at.desc(), Plan.id)
+        )
+    ).all()
     return ok([plan_out(p) for p in rows])
 
 
 # 接口：POST /admin/plans — 新增套餐（需管理员 token）
-# 入参：PlanIn{name(≤16), duration(1~3650 天), price(≥0), origPrice, tag, benefits[]}。
+# 入参：PlanIn{name(≤16), duration(1~3650 天), price(≥0), origPrice, tag, benefits[], sort(≥0, 默认 0)}。
 # 默认值：id = "p" + 秒级时间戳；icon="crown"；tag 缺省 "新套餐"；tag_type="primary"；sales=0；
-#        status="off"（新增后默认下架，需再编辑上架）；sort = 当前最大 sort + 1。
+#        status="off"（新增后默认下架，需再编辑上架）；sort 取入参，缺省 0。
 # 响应：plan_out。
 @router.post("/plans", summary="新增套餐")
 async def create_plan(
     payload: PlanIn, admin: Admin = Depends(get_current_admin), db: AsyncSession = Depends(get_db)
 ):
-    max_sort = await db.scalar(select(func.max(Plan.sort))) or 0
     plan = Plan(
         id=f"p{int(_time.time())}",
         name=payload.name,
@@ -481,7 +491,7 @@ async def create_plan(
         tag_type="primary",
         sales=0,
         status="off",
-        sort=max_sort + 1,
+        sort=payload.sort,
         benefits=payload.benefits or [],
     )
     db.add(plan)
@@ -492,6 +502,7 @@ async def create_plan(
 
 # 接口：PUT /admin/plans/{plan_id} — 编辑套餐 / 上下架（需管理员 token）
 # 路径参数：plan_id。入参 PlanUpdateIn 各字段可选；duration 变更时同步 duration_label="{n} 天"。
+# sort 为排序权重（非负整数，越大越靠前），传入即持久化。
 # 状态机：status 仅接受 "on"（上架）/ "off"（下架），其他值忽略；响应 plan_out；套餐不存在抛 404。
 @router.put("/plans/{plan_id}", summary="编辑套餐（含上下架切换）")
 async def update_plan(
@@ -518,6 +529,8 @@ async def update_plan(
         plan.benefits = payload.benefits
     if payload.status in ("on", "off"):
         plan.status = payload.status
+    if payload.sort is not None:
+        plan.sort = payload.sort
     await db.commit()
     await db.refresh(plan)
     return ok(plan_out(plan))

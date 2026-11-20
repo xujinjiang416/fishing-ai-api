@@ -243,8 +243,8 @@ async def fetch_weather(place: str) -> dict:
         "wind_level": wind_level,
         "wind_speed": wind_speed_ms,
         "cloud_cover": now.get("cloud"),
-        "rain_prob": daily.get("precip"),
-        "rainfall": now.get("precip"),
+        # 降水量取当日累计值；日预报缺失时回退当前小时降水量
+        "rainfall": daily.get("precip") if daily.get("precip") is not None else now.get("precip"),
         "uv": uv,
         "visibility": now.get("vis"),
         "aqi": aqi,

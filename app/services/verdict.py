@@ -1,7 +1,7 @@
 """verdict.py — 基于真实天气数据的鱼情评分与智能研判
 
 核心目标（需求 2/3/4）：
-- 把多维度真实天气（气温/水温/气压/风/降水/湿度/日照等）标准化成结构化上下文；
+- 把多维度真实天气（气温/气压/风/降水/湿度/日照等）标准化成结构化上下文；
 - 用「大模型 + 鱼类行为学规则」双路径，输出 0-100 分的可解释鱼情结论；
 - 结论包含：总分、4 维度分项得分与依据、适宜鱼种推荐、总体依据、出钓建议。
 
@@ -66,6 +66,25 @@ def _clamp(v: float, lo: int = 0, hi: int = 100) -> int:
     return max(lo, min(hi, int(round(v))))
 
 
+# 已下线的水温表述：大模型可能凭经验自行补充，这里统一清洗为气温口径。
+_WATER_TERMS = ("水体温度", "水层温度", "水温")
+
+
+def _scrub_water_terms(text: str) -> str:
+    """把文本中的水温表述替换为气温，确保输出不再出现水温相关内容。
+
+    Args:
+        text: 大模型返回的依据 / 建议文本。
+
+    Returns:
+        str: 清洗后的文本。
+    """
+    s = str(text or "")
+    for term in _WATER_TERMS:
+        s = s.replace(term, "气温")
+    return s
+
+
 def _season(date_str: str | None) -> str:
     """据日期推断季节（用于鱼种/食性适配）。
 
@@ -113,34 +132,34 @@ def _sunshine_hours(sunrise: str, sunset: str) -> str:
 # ---------------- 规则引擎（确定性兜底 + 校准基线） ----------------
 
 def _feeding_score(w: dict) -> tuple[int, str]:
-    """摄食意愿：水温主驱动，气压趋势与湿度修正。
+    """摄食意愿：气温主驱动，气压趋势与湿度修正。
 
     分步说明：
-    1. 水温缺失时用气温 -1 近似；
-    2. 按水温落在 12~24 / 8~12 或 24~28 / 4~8 或 28~32 / 极端 四档给基础分；
+    1. 气温缺失按 78 分；
+    2. 按气温落在 15~25 / 10~15 或 25~30 / 5~10 或 30~35 / 极端 四档给基础分；
     3. 气压上升 +6、下降 -12；湿度 >95 或 <20 再 -10；
     4. 结果夹取到 0~100，并拼接可读依据。
 
     Args:
-        w: camelCase 天气观测（读取 waterTemp/pressureTrend/humidity）。
+        w: camelCase 天气观测（读取 temp/pressureTrend/humidity）。
 
     Returns:
         tuple[int, str]: (摄食意愿得分, 依据文本)。
     """
-    wt = w.get("waterTemp")
-    if wt is None:
-        wt = _num(w.get("temp"), 15) - 1
-
-    if 12 <= wt <= 24:
-        s, band = 88, "处于鲫鲤摄食最适区间"
-    elif 8 <= wt < 12 or 24 < wt <= 28:
-        s, band = 66, "略偏离最适区间，摄食尚可"
-    elif 4 <= wt < 8 or 28 < wt <= 32:
-        s, band = 42, "水温偏高/偏低，摄食减弱"
+    t = w.get("temp")
+    if t is None:
+        s, reasons = 78, ["气温数据缺失，按中性处理"]
     else:
-        s, band = 22, "水温极端，摄食意愿低"
+        if 15 <= t <= 25:
+            s, band = 88, "处于鲫鲤摄食最适区间"
+        elif 10 <= t < 15 or 25 < t <= 30:
+            s, band = 66, "略偏离最适区间，摄食尚可"
+        elif 5 <= t < 10 or 30 < t <= 35:
+            s, band = 42, "气温偏高/偏低，摄食减弱"
+        else:
+            s, band = 22, "气温极端，摄食意愿低"
+        reasons = [f"气温{t:.0f}℃{band}"]
 
-    reasons = [f"水温{wt:.0f}℃{band}"]
     if w.get("pressureTrend") == "up":
         s += 6
         reasons.append("气压回升促进开口")
@@ -198,17 +217,16 @@ def _activity_score(w: dict) -> tuple[int, str]:
 
 
 def _bite_score(w: dict) -> tuple[int, str]:
-    """咬口频率：气压趋势 + 降水概率 + 风力 + 温差。
+    """咬口频率：气压趋势 + 风力 + 温差。
 
     分步说明：
     1. 以 75 为基准分；气压上升 +10、下降 -18、平稳不加分；
-    2. 降水概率 <=20% +4，>=70% -22，其余 -8；
-    3. 风速 >8m/s 再 -18；
-    4. 昼夜温差 >10℃ 再 -6；
-    5. 结果夹取到 0~100。
+    2. 风速 >8m/s 再 -18；
+    3. 昼夜温差 >10℃ 再 -6；
+    4. 结果夹取到 0~100。
 
     Args:
-        w: camelCase 天气观测（读取 pressureTrend/rainProb/windSpeed/tempMax/tempMin）。
+        w: camelCase 天气观测（读取 pressureTrend/windSpeed/tempMax/tempMin）。
 
     Returns:
         tuple[int, str]: (咬口频率得分, 依据文本)。
@@ -223,18 +241,6 @@ def _bite_score(w: dict) -> tuple[int, str]:
         reasons.append("气压下滑，咬口变差")
     else:
         reasons.append("气压平稳")
-
-    rp = w.get("rainProb")
-    if rp is not None:
-        if rp <= 20:
-            s += 4
-            reasons.append("降水概率低")
-        elif rp >= 70:
-            s -= 22
-            reasons.append("降水概率高不利下竿")
-        else:
-            s -= 8
-            reasons.append("有降水可能，口变滑")
 
     ws = w.get("windSpeed")
     if ws is not None and ws > 8:
@@ -252,29 +258,29 @@ def _bite_score(w: dict) -> tuple[int, str]:
 
 
 def _species_score(w: dict, season: str) -> tuple[int, list[str], str]:
-    """鱼种适配度：按水温+季节匹配高适口性鱼种。
+    """鱼种适配度：按气温+季节匹配高适口性鱼种。
 
     分步说明：
-    1. 用内置鱼种的适宜水温区间筛出候选；
+    1. 用内置鱼种的适宜气温区间筛出候选；
     2. 冬季只保留耐寒鱼种，最多取 4 种；
     3. 按候选数量映射分数：>=4 得 90，3 得 78，2 得 60，1 得 40，0 得 20。
 
     Args:
-        w: camelCase 天气观测（读取 waterTemp/temp）。
+        w: camelCase 天气观测（读取 temp）。
         season: 季节中文名（春/夏/秋/冬）。
 
     Returns:
         tuple[int, list[str], str]: (适配度得分, 适宜鱼种列表, 依据文本)。
     """
-    wt = w.get("waterTemp")
-    if wt is None:
-        wt = _num(w.get("temp"), 15) - 1
+    t = w.get("temp")
+    if t is None:
+        t = 15
 
     cands = [
-        ("鲫鱼", 4, 30), ("鲤鱼", 8, 32), ("草鱼", 14, 33),
-        ("鳊鱼", 10, 30), ("翘嘴", 10, 26), ("罗非", 18, 35),
+        ("鲫鱼", 5, 30), ("鲤鱼", 10, 32), ("草鱼", 16, 34),
+        ("鳊鱼", 12, 30), ("翘嘴", 12, 28), ("罗非", 20, 35),
     ]
-    fish = [name for name, lo, hi in cands if lo <= wt <= hi]
+    fish = [name for name, lo, hi in cands if lo <= t <= hi]
 
     # 季节：冬季优先留耐寒鱼种，夏季留广温鱼种
     if season == "冬季":
@@ -292,7 +298,7 @@ def _species_score(w: dict, season: str) -> tuple[int, list[str], str]:
     else:
         s = 20
 
-    reason = f"{season}水温{wt:.0f}℃，适宜钓{'、'.join(fish) or '少量耐性鱼种'}"
+    reason = f"{season}气温{t:.0f}℃，适宜钓{'、'.join(fish) or '少量耐性鱼种'}"
     return _clamp(s), fish, reason
 
 
@@ -367,9 +373,10 @@ _LLM_SYSTEM_PROMPT = (
     '"advice":"一句话出钓建议（60字内，含出钓时段与钓法/饵料方向）"}\n'
     "评分权重（score 需按此加权、与各分项一致）：摄食意愿30%、游动活跃度25%、咬口频率30%、鱼种适配度15%。\n"
     "要求：\n"
-    "1. 水温对摄食影响最大，气压趋势与风对咬口影响最大，季节与水温决定鱼种；\n"
+    "1. 气温对摄食影响最大，气压趋势与风对咬口影响最大，季节与气温决定鱼种；\n"
     "2. 每条依据必须引用具体数值、可验证，禁止空泛表述；\n"
-    "3. score 约等于 dimensions 各分项乘权重的加权和。"
+    "3. score 约等于 dimensions 各分项乘权重的加权和；\n"
+    "4. 严禁提及水温、水体温度，所有判断只能基于给定字段中的气温。"
 )
 
 
@@ -395,10 +402,8 @@ def build_brief(weather: dict, place: str | None, date_str: str | None, day_labe
         "季节": _season(date_str),
         "天气现象": weather.get("condition"),
         "气温": f"{weather.get('tempMin')}~{weather.get('tempMax')}℃（当前 {weather.get('temp')}℃，体感 {weather.get('tempFeel')}℃）",
-        "水温": f"{weather.get('waterTemp')}℃",
         "气压": f"{weather.get('pressure')}hPa，6小时{weather.get('pressure6h')}（{trend}）",
         "风": f"{weather.get('windDir')}{weather.get('windLevel')}，风速 {weather.get('windSpeed')}m/s",
-        "降水概率": f"{weather.get('rainProb')}%",
         "降水量": f"{weather.get('rainfall')}mm",
         "湿度": f"{weather.get('humidity')}%",
         "云量": f"{weather.get('cloudCover')}%",
@@ -431,7 +436,7 @@ def _coerce_dimension(item: dict, fallback: dict) -> dict:
     score = _clamp(_num(raw_score, fallback["score"]))
     if raw_score is None:
         score = fallback["score"]
-    reason = str(item.get("reason") or "").strip() or fallback["reason"]
+    reason = _scrub_water_terms(str(item.get("reason") or "").strip()) or fallback["reason"]
     return {"key": key, "name": name, "score": score, "weight": _DIM_MAP[key]["weight"], "reason": reason}
 
 
@@ -440,7 +445,8 @@ def normalize(payload: dict, weather: dict, date_str: str | None, rule: dict) ->
 
     分步说明：
     1. 维度：按 key 去重并逐个规范化，LLM 漏掉的维度用规则引擎补齐；
-    2. 总分：LLM 未给时用分项加权和；
+    2. 总分：始终用分项得分 × 固定权重回算，不直接采用 LLM 给的总分，
+       避免大模型把不同地点统一写成同一个分数（如固定 72）或与分项自相矛盾；
     3. 鱼种 / 依据 / 建议：LLM 为空时分别回退规则引擎值，并做长度截断。
 
     Args:
@@ -473,11 +479,9 @@ def normalize(payload: dict, weather: dict, date_str: str | None, rule: dict) ->
     else:
         dims = [dict(d) for d in rule["dimensions"]]
 
-    # 总分：LLM 给了用 LLM，否则用分项加权和
-    if payload.get("score") is None:
-        score = _clamp(sum(d["score"] * d["weight"] for d in dims))
-    else:
-        score = _clamp(_num(payload.get("score"), rule["score"]))
+    # 总分始终按固定权重回算：LLM 只负责分项判断，不能直接指定总分。
+    # 这样不同地点的总分严格由分项差异驱动，不会出现固定 72 分。
+    score = _clamp(sum(d["score"] * d["weight"] for d in dims))
 
     species_payload = payload.get("species")
     species = (
@@ -486,8 +490,8 @@ def normalize(payload: dict, weather: dict, date_str: str | None, rule: dict) ->
         else []
     ) or rule["species"]
 
-    reason = str(payload.get("reason") or "").strip()[:120] or rule["reason"]
-    advice = str(payload.get("advice") or "").strip()[:80] or rule["advice"]
+    reason = _scrub_water_terms(str(payload.get("reason") or "").strip())[:120] or rule["reason"]
+    advice = _scrub_water_terms(str(payload.get("advice") or "").strip())[:80] or rule["advice"]
 
     return {
         "score": score,

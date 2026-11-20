@@ -72,9 +72,6 @@ class Settings(BaseSettings):
     # ---- 微信（留空则走模拟实现） ----
     wechat_appid: str = ""                                   # 小程序 AppID
     wechat_secret: str = ""                                  # 小程序 AppSecret
-    # 内置演示账号（手机号 + 密码可直接登录，便于免注册体验完整数据）
-    demo_phone: str = "13800138000"                          # 演示账号手机号
-    demo_password: str = "123456"                            # 演示账号密码
 
     # ---- 管理后台（admins 表与小程序 users 表分开；可用 .env 覆盖）----
     admin_username: str = "admin"                            # 初始化超级管理员账号

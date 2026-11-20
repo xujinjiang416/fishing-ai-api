@@ -119,6 +119,8 @@ class PlanIn(BaseModel):
     tag: str | None = None
     # 权益说明列表，前端逐条展示
     benefits: list[str] = []
+    # 排序权重：非负整数，越大越靠前，默认 0
+    sort: int = Field(default=0, ge=0)
 
     @field_validator("name")
     @classmethod
@@ -147,6 +149,8 @@ class PlanUpdateIn(BaseModel):
     benefits: list[str] | None = None
     # 上下架状态：on=上架 / off=下架
     status: str | None = None
+    # 排序权重：非负整数，越大越靠前
+    sort: int | None = Field(default=None, ge=0)
 
 
 class GoodsIn(BaseModel):
@@ -382,8 +386,13 @@ def admin_user_out(user, weather_count: int = 0) -> dict:
     Returns:
         dict: 用户资料 + 会员套餐信息 + 查询次数；空值统一给中文占位符。
     """
+    account = (user.account or "").strip()
+    phone = (user.phone or "").strip()
+    if account and phone and account == phone:
+        account = ""
     return {
         "uid": user.uid,
+        "username": account,
         "nickname": user.nickname,
         "avatar": user.avatar_text,
         "phone": user.phone,

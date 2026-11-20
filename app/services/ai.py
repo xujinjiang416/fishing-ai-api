@@ -60,10 +60,10 @@ def _camel(key: str) -> str:
     """把单个 snake_case 键转成 camelCase（首段保持小写）。
 
     Args:
-        key: 形如 ``water_temp`` 的键。
+        key: 形如 ``temp_max`` 的键。
 
     Returns:
-        str: 形如 ``waterTemp`` 的键。
+        str: 形如 ``tempMax`` 的键。
     """
     head, *rest = key.split("_")
     return head + "".join(x[:1].upper() + x[1:] for x in rest)
@@ -113,7 +113,7 @@ def _base_weather(place: str | None, place_detail: str | None, date_str: str | N
     大模型可用时，用它返回的实时数值覆盖本结果中对应的观测字段。
 
     抖动算法：用 (地点, 日期) 求 MD5 种子，取模 13 得到 -6~+6 的偏移量，
-    同步微调总分、气温与水温（水温步长 0.1℃），保证同点同日结果可复现。
+    同步微调总分与气温，保证同点同日结果可复现。
 
     Args:
         place: 地点名（省/市/区），为空时保留 WEATHER 模板值。
@@ -121,7 +121,7 @@ def _base_weather(place: str | None, place_detail: str | None, date_str: str | N
         date_str: 查询日期（ISO，取前 10 位参与抖动）。
 
     Returns:
-        dict: snake_case 观测字段（score/temp/water_temp 等）。
+        dict: snake_case 观测字段（score/temp/humidity 等）。
     """
     w = deepcopy(WEATHER)
     if place:
@@ -133,24 +133,32 @@ def _base_weather(place: str | None, place_detail: str | None, date_str: str | N
     delta = (_seed(w["place"], date_str) % 13) - 6
     w["score"] = max(20, min(98, int(w["score"]) + delta))
     w["temp"] = w["temp"] + (delta // 3)
-    w["water_temp"] = round(w["water_temp"] + delta / 10, 1)
     return w
 
 
 def _build_slots(score: int) -> list:
-    """按时段概率随总分等比缩放（最低 5、最高 99），返回 snake_case 时段列表。
+    """按时段概率随总分等比缩放，并按统一评分阈值重算每个时段的口型。
+
+    分步说明：
+    1. 以模板总分为基准，把每个时段的基准概率按 score 等比缩放；
+    2. 概率夹取到 5~99；
+    3. 用 ``verdict_of(时段概率)`` 重算 level/name，确保每个时段口型严格遵循
+       爆户 / 连杆 / 有口 / 慢口 / 停口 的分级阈值，而不是沿用模板里的固定标签。
 
     Args:
         score: 鱼情总分（0~100），作为缩放分子。
 
     Returns:
-        list: 每个时段 dict 的 ``p``（概率）按 ``score / 模板总分`` 缩放并夹取。
+        list: 每个时段 dict 的 p、level、name 均按评分标准生成。
     """
     base = max(int(WEATHER["score"]), 1)
     slots = []
     for s in SLOTS:
         item = deepcopy(s)
         item["p"] = max(5, min(99, int(round(item["p"] * score / base))))
+        level = verdict_of(item["p"])
+        item["level"] = level["level"]
+        item["name"] = level["name"]
         slots.append(item)
     return slots
 
@@ -190,7 +198,7 @@ def _finalize(w: dict, date_str: str | None) -> dict:
         "highlights": [
             f"气压 {w['pressure']}hPa（6h {w['pressure_6h']}）",
             f"{w['wind_dir']}{w['wind_level']} · 水体溶氧充足",
-            f"水温 {w['water_temp']}℃ · 鱼活性区间",
+            f"降水量 {w['rainfall']}mm · 湿度 {w['humidity']}%",
             "日出后 1.5 小时为黄金窗口",
         ],
     }
@@ -223,12 +231,12 @@ _WEATHER_SYSTEM_PROMPT = (
     "字段名必须严格使用以下英文下划线键，缺一不可：\n"
     "condition（天气现象，含趋势，如「阴转晴」）、condition_icon（sun/cloud/partly/rain 之一）、"
     "temp（当前温度，数字）、temp_max（最高温，数字）、temp_min（最低温，数字）、"
-    "temp_feel（体感温度，数字）、water_temp（水温，数字，比气温低 0~3℃）、"
+    "temp_feel（体感温度，数字）、"
     "pressure（气压 hPa，数字）、pressure_6h（6 小时气压变化，带正负号，如「+3.2」）、"
     "pressure_trend（up/down/flat）、wind_dir（风向，如「西北风」）、"
     "wind_level（风力，如「4-5级转3-4级」，白天转夜间用「转」连接）、wind_speed（风速 m/s，数字）、"
-    "humidity（相对湿度 %，整数）、cloud_cover（云量 %，整数）、rain_prob（降水概率 %，整数）、"
-    "rainfall（降水量 mm，数字）、uv（紫外线指数，数字）、visibility（能见度 km，数字）、"
+    "humidity（相对湿度 %，整数）、cloud_cover（云量 %，整数）、"
+    "rainfall（今日累计降水量 mm，数字）、uv（紫外线指数，数字）、visibility（能见度 km，数字）、"
     "aqi（空气质量指数，数字）、aqi_text（对应 AQI 区间的等级：0-50优、51-100良、101-150轻度污染…）、"
     "moon_phase（月相，如「下弦月」）、moon_illum（月相照亮百分比，数字）、"
     "sunrise（日出 HH:MM，24 小时制补零）、sunset（日落 HH:MM，24 小时制补零）、"
@@ -240,8 +248,8 @@ _WEATHER_SYSTEM_PROMPT = (
 
 # 允许被大模型 / 天气源覆盖的数值型观测字段；合并时统一走 _as_number 转型。
 _NUMERIC_WEATHER_KEYS = (
-    "temp", "temp_max", "temp_min", "temp_feel", "water_temp",
-    "pressure", "wind_speed", "humidity", "cloud_cover", "rain_prob",
+    "temp", "temp_max", "temp_min", "temp_feel",
+    "pressure", "wind_speed", "humidity", "cloud_cover",
     "rainfall", "uv", "visibility", "aqi", "moon_illum",
 )
 
@@ -317,6 +325,18 @@ def _merge_weather_obs(payload: dict, base: dict) -> dict:
     score_src = obs.get("score") if isinstance(obs, dict) else payload.get("score")
     if score_src is not None:
         w["score"] = int(max(0, min(100, _as_number(score_src, w.get("score")))))
+
+    # QWeather 免费版不提供 6 小时气压趋势。若不在这里按真实变化推导，
+    # 所有地点会共用 seed 模板（up），导致评分高度趋同。
+    # 无真实 6 小时变化时按「平稳」处理，避免默认「上升」给所有地点叠加同样加分。
+    if not obs.get("pressure_trend"):
+        raw6 = _as_number(str(obs.get("pressure_6h", "")).replace("+", ""), None)
+        if raw6 is None:
+            w["pressure_trend"] = "flat"
+            w["pressure_6h"] = "0.0"
+        else:
+            w["pressure_trend"] = "up" if raw6 > 0.5 else ("down" if raw6 < -0.5 else "flat")
+            w["pressure_6h"] = f"{raw6:+.1f}"
 
     return w
 

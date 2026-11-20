@@ -1,9 +1,9 @@
 """auth.py — 登录 / 注册 / 退出
 
-职责：小程序端账号体系入口，覆盖手机号密码注册 / 登录、微信小程序 code 登录、
-退出登录与演示账号一键登录；成功后统一签发 JWT 并返回用户信息。
+职责：小程序端账号体系入口，覆盖用户名密码注册 / 登录、微信小程序 code 登录、
+退出登录；成功后统一签发 JWT 并返回用户信息。
 
-鉴权要求：本文件所有接口均为公开接口（不校验登录态）；仅 /demo 依赖已初始化的演示数据。
+鉴权要求：本文件所有接口均为公开接口（不校验登录态）。
 
 依赖服务：
 - MySQL（users 表，AsyncSession 会话）；
@@ -32,55 +32,57 @@ from ...services import wechat
 
 router = APIRouter(prefix="/auth", tags=["鉴权"])
 
-# 演示账号在 users.account 字段中的固定标识；由 `python -m app.seed` 初始化。
-# 仅用于本地调试 / 免注册体验，生产环境应移除该路由或限制访问。
-DEMO_ACCOUNT = "demo"
-
 
 def _new_user(
     openid: str | None = None,
     nickname: str | None = None,
-    phone: str | None = None,
+    account: str | None = None,
     password_hash: str | None = None,
 ) -> User:
     """构造新用户实体（只建对象，不落库，由调用方 add / commit）。
 
-    参数：openid 微信身份标识；nickname 昵称；phone 手机号；
+    参数：openid 微信身份标识；nickname 昵称；account 用户名（登录账号）；
     password_hash 已哈希的密码（明文不落库）。
     生成规则：uid 取 `u_` + 8 位随机十六进制（唯一索引由数据库兜底）；
-    昵称缺省为「钓友 + 手机号 / openid 末 4 位」；头像文字取昵称首字；
+    用户名注册时昵称直接取用户名，不再自动生成「钓友+后缀」等标识；
+    微信登录未提供昵称时使用中性占位「钓友」；头像文字取昵称首字；
     初始等级固定 Lv.1 新手，注册日期取当天。
     """
-    seed_name = phone or openid or "钓友"
+    seed_name = nickname or account or "钓友"
     return User(
         uid="u_" + uuid4().hex[:8],
+        account=account,
         openid=openid,
-        phone=phone,
+        phone=None,
         password_hash=password_hash,
-        nickname=nickname or f"钓友{seed_name[-4:]}",
-        avatar_text=(nickname or seed_name)[:1],
+        nickname=seed_name,
+        avatar_text=seed_name[:1],
         level="Lv.1 新手",
         joined=today(),
         location=None,
     )
 
 
-@router.post("/register", summary="注册（手机号 + 密码 6-16 位）")
+@router.post("/register", summary="注册（用户名 4-16 位 + 密码 6-16 位）")
 async def register(payload: RegisterIn, db: AsyncSession = Depends(get_db)):
-    """注册新用户（手机号即账号）。
+    """注册新用户（用户名即登录账号）。
 
     方法与路径：POST /auth/register（公开）。
-    请求参数 RegisterIn：phone 必须为 11 位手机号；password 6-16 位（均由 schema 校验）；
-    confirmPassword 可选，传入时必须与 password 一致；nickname 可选。
+    请求参数 RegisterIn：username 为 4-16 位中英文 / 数字 / _ / -，password 6-16 位；
+    两者均禁止空格与表情，confirmPassword 可选，传入时必须与 password 一致；nickname 可选。
     响应：{ token, user, isNew: true } —— 注册成功即签发登录态，前端无需再登录。
-    限制：同一手机号只能注册一次，重复注册返回 400；密码仅保存哈希。
+    限制：同一用户名只能注册一次，重复注册返回 400「用户名已存在」；密码仅保存哈希。
     """
-    phone = payload.phone  # 已在 schema 中校验为 11 位手机号
-    if await db.scalar(select(User).where(User.phone == phone)):
-        raise HTTPException(status_code=400, detail="该手机号已注册，请直接登录")
+    username = payload.username
+    # 兼容历史数据：曾以手机号作为登录账号的用户，其手机号也不允许被重新注册
+    exists = await db.scalar(
+        select(User).where((User.account == username) | (User.phone == username))
+    )
+    if exists:
+        raise HTTPException(status_code=400, detail="用户名已存在")
 
     user = _new_user(
-        phone=phone,
+        account=username,
         nickname=payload.nickname,
         password_hash=hash_password(payload.password),
     )
@@ -90,19 +92,26 @@ async def register(payload: RegisterIn, db: AsyncSession = Depends(get_db)):
     return ok({"token": create_token(user.id), "user": user_out(user), "isNew": True})
 
 
-@router.post("/login", summary="登录（手机号 + 密码）")
+@router.post("/login", summary="登录（用户名 + 密码）")
 async def login(payload: PasswordLoginIn, db: AsyncSession = Depends(get_db)):
-    """手机号 + 密码登录。
+    """用户名 + 密码登录。
 
     方法与路径：POST /auth/login（公开）。
-    请求参数 PasswordLoginIn：account 必须是 11 位手机号；password 6-16 位（schema 校验）。
+    请求参数 PasswordLoginIn：account 为用户名（4-16 位），password 6-16 位（schema 校验）。
     响应：{ token, user, isNew: false }，token 为 30 天有效期的 JWT。
     鉴权说明：账号不存在与密码错误返回同一条提示，防止账号枚举。
+    兼容说明：历史用户曾以手机号作为登录账号，account 未命中时回退按手机号查询，
+    命中后自动把手机号写回 account，后续统一走用户名登录。
     """
-    user = await db.scalar(select(User).where(User.phone == payload.account))
+    user = await db.scalar(select(User).where(User.account == payload.account))
+    if not user:
+        user = await db.scalar(select(User).where(User.phone == payload.account))
+        if user and not user.account:
+            user.account = payload.account
+            await db.commit()
     if not user or not verify_password(payload.password, user.password_hash):
         # 不区分「账号不存在」与「密码错误」，避免账号枚举
-        raise HTTPException(status_code=400, detail="手机号或密码不正确")
+        raise HTTPException(status_code=400, detail="用户名或密码不正确")
     return ok({"token": create_token(user.id), "user": user_out(user), "isNew": False})
 
 
@@ -141,16 +150,4 @@ async def logout():
     return ok(None, "已退出登录")
 
 
-@router.get("/demo", summary="一键进入演示账号（调试用）")
-async def demo(db: AsyncSession = Depends(get_db)):
-    """一键登录演示账号（调试用）。
 
-    方法与路径：GET /auth/demo（公开）。
-    响应：{ token, user }。
-    限制：演示账号需先执行 `python -m app.seed` 初始化，未初始化返回 404；
-    本接口签发真实 token，生产环境应关闭或加访问控制。
-    """
-    user = await db.scalar(select(User).where(User.account == DEMO_ACCOUNT))
-    if not user:
-        raise HTTPException(status_code=404, detail="演示账号未初始化，请先执行 python -m app.seed")
-    return ok({"token": create_token(user.id), "user": user_out(user)})

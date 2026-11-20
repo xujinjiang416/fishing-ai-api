@@ -99,7 +99,8 @@ async def profile(
     """获取我的资料。
 
     方法与路径：GET /user/profile（需登录）。
-    响应：用户对外结构（手机号已脱敏）；顺带执行广告计数跨天重置。
+    响应：用户对外结构（含用户名，不含手机号，仅返回 phoneBound 绑定状态）；
+    顺带执行广告计数跨天重置。
     """
     user = await _user(db, user_id)
     await _roll_ad_daily(db, user)
@@ -116,6 +117,7 @@ async def update_profile(
 
     方法与路径：PUT /user/profile（需登录）。
     请求参数 ProfileIn：nickname / city / phone 均可选，仅传入非空字段会被更新；
+    phone 为后续手机号绑定预留入口，写入 users.phone 但响应不回传手机号；
     nickname 变更时同步头像文字（取首字）。
     响应：更新后的用户结构。
     """
@@ -547,14 +549,14 @@ async def membership(
     返回当前会员状态 + 所有「已上架」的会员套餐（供开通页 / 解锁弹窗展示）。
     方法与路径：GET /user/membership（需登录）。
     响应：isMember / memberExpire / plan / planName，以及 plans（status 为空或 on，
-    按 sort、id 升序）。
+    按排序权重降序、创建时间降序）。
     """
     user = await _user(db, user_id)
     rows = (
         await db.scalars(
             select(Plan)
             .where((Plan.status.is_(None)) | (Plan.status == "on"))
-            .order_by(Plan.sort, Plan.id)
+            .order_by(Plan.sort.desc(), Plan.created_at.desc(), Plan.id)
         )
     ).all()
     return ok(

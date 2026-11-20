@@ -19,6 +19,10 @@ seeded 已提供管理员、月卡套餐、普通 / 会员用户、钓点 ai_tes
 - 评论删除会级联更新钓点的 commentCount，断言通过公开钓点详情接口观察。
 """
 
+from datetime import datetime, timedelta
+
+from app.models import Plan, User
+
 
 async def test_public_config_returns_rules_and_plans(client):
     """公开配置接口返回签到积分、广告积分与上架套餐。
@@ -36,6 +40,159 @@ async def test_public_config_returns_rules_and_plans(client):
     assert data["checkin"]["normalPoints"] == 1
     assert data["ad"]["points"] == 5
     assert any(p["id"] == "month" for p in data["plans"])
+
+
+async def test_register_and_login_with_username(client):
+    """用户名 + 密码注册与登录全流程。
+
+    前置条件：库中无同名用户。
+    预期行为：注册成功返回 token 与用户信息；同一用户名可立即登录；
+    重复注册返回 400；错误密码登录返回 400。
+    断言意图：确认手机号已不再是登录账号，用户名成为唯一登录标识。
+    """
+    payload = {
+        "username": "angler_01",
+        "password": "abc12345",
+        "confirmPassword": "abc12345",
+    }
+    r = await client.post("/api/auth/register", json=payload)
+    assert r.json()["code"] == 0
+    assert r.json()["data"]["token"]
+    user = r.json()["data"]["user"]
+    # 用户名与昵称完全一致，不再生成「钓友+后缀」
+    assert user["username"] == "angler_01"
+    assert user["nickname"] == "angler_01"
+
+    login = await client.post(
+        "/api/auth/login", json={"account": "angler_01", "password": "abc12345"}
+    )
+    assert login.json()["code"] == 0
+    assert login.json()["data"]["token"]
+
+    dup = await client.post("/api/auth/register", json=payload)
+    assert dup.status_code == 400
+    assert dup.json()["code"] == 400
+    assert dup.json()["msg"] == "用户名已存在"
+
+    wrong = await client.post(
+        "/api/auth/login", json={"account": "angler_01", "password": "wrong123"}
+    )
+    assert wrong.status_code == 400
+
+
+async def test_auth_rejects_invalid_username_and_password(client):
+    """用户名 / 密码边界：长度越界、纯空格、含空格、含表情均返回 422。
+
+    断言意图：验证后端二次校验可拦截绕过前端的所有非法输入。
+    """
+    base = {"password": "abc12345", "confirmPassword": "abc12345"}
+
+    # 用户名 3 位（过短）与 17 位（过长）
+    for name in ("abc", "a" * 17):
+        r = await client.post("/api/auth/register", json={**base, "username": name})
+        assert r.status_code == 422
+        assert "4-16" in r.json()["msg"]
+
+    # 纯空格 / 含空格 / 含表情
+    for name, keyword in (
+        ("      ", "空格"),
+        ("abc def", "空格"),
+        ("abc😀def", "表情"),
+    ):
+        r = await client.post("/api/auth/register", json={**base, "username": name})
+        assert r.status_code == 422
+        assert keyword in r.json()["msg"]
+
+    # 密码纯空格 / 含表情 / 过短
+    for pwd, keyword in (
+        ("      ", "纯空格"),
+        ("abc😀123", "表情"),
+        ("12345", "6-16"),
+    ):
+        r = await client.post(
+            "/api/auth/register",
+            json={"username": "angler_02", "password": pwd, "confirmPassword": pwd},
+        )
+        assert r.status_code == 422
+        assert keyword in r.json()["msg"]
+
+    # 登录入参同样走二次校验
+    r = await client.post("/api/auth/login", json={"account": "abc😀def", "password": "abc12345"})
+    assert r.status_code == 422
+
+
+async def test_profile_hides_phone_and_preserves_data(client, normal_headers, session_factory):
+    """个人资料响应不返回手机号，仅返回用户名与绑定状态；数据库手机号完整保留。
+
+    前置条件：普通用户已有用户名，模拟历史手机号 13812345678。
+    预期行为：
+    - GET /user/profile 返回 username 与 phoneBound，且不含 phone 字段；
+    - users.phone 仍为原值；
+    - PUT /user/profile 传入 phone（预留绑定入口）可写入，但响应不回传手机号；
+    - 登录返回的用户对象同样不含手机号。
+    断言意图：满足手机号不对外展示，同时保留绑定扩展能力与原始数据。
+    """
+    async with session_factory() as db:
+        u = await db.get(User, 1)
+        u.phone = "13812345678"
+        await db.commit()
+
+    r = await client.get("/api/user/profile", headers=normal_headers)
+    data = r.json()["data"]
+    assert data["username"] == "13900000001"
+    assert data["phoneBound"] is True
+    assert "phone" not in data
+
+    async with session_factory() as db:
+        assert (await db.get(User, 1)).phone == "13812345678"
+
+    # 预留绑定入口：可写入手机号，但响应仍不暴露该字段
+    r2 = await client.put(
+        "/api/user/profile", headers=normal_headers, json={"phone": "13900001111"}
+    )
+    assert r2.json()["code"] == 0
+    assert "phone" not in r2.json()["data"]
+    assert r2.json()["data"]["phoneBound"] is True
+
+    async with session_factory() as db:
+        assert (await db.get(User, 1)).phone == "13900001111"
+
+    login = await client.post(
+        "/api/auth/login", json={"account": "13900000001", "password": "123456"}
+    )
+    assert login.json()["code"] == 0
+    assert "phone" not in login.json()["data"]["user"]
+    assert login.json()["data"]["user"]["username"] == "13900000001"
+
+    # 历史账号：用户名与手机号相同时，username 置空，避免变相展示手机号
+    async with session_factory() as db:
+        u = await db.get(User, 1)
+        u.account = "13900001111"
+        await db.commit()
+    r3 = await client.get("/api/user/profile", headers=normal_headers)
+    assert r3.json()["data"]["username"] == ""
+    assert r3.json()["data"]["phoneBound"] is True
+
+
+async def test_admin_users_returns_username(client, admin_headers, session_factory):
+    """管理后台用户列表返回并支持按用户名检索。
+
+    前置条件：普通用户设置独立用户名 angler_norm 与手机号（二者不同）。
+    预期行为：keyword 命中用户名，列表项 username 与账号一致。
+    断言意图：确认管理后台展示与登录账号规则保持同步。
+    """
+    async with session_factory() as db:
+        u = await db.get(User, 1)
+        u.account = "angler_norm"
+        u.phone = "13812345678"
+        await db.commit()
+
+    r = await client.get("/api/admin/users?keyword=angler_norm", headers=admin_headers)
+    data = r.json()["data"]
+    assert data["total"] >= 1
+    row = next(x for x in data["list"] if x["uid"] == "u_norm")
+    assert row["username"] == "angler_norm"
+    assert row["nickname"] == "普通用户"
 
 
 async def test_checkin_points_by_role(client, normal_headers, member_headers):
@@ -194,6 +351,86 @@ async def test_membership_plans_and_purchase(client, normal_headers):
 
     r2 = await client.get("/api/user/membership", headers=normal_headers)
     assert r2.json()["data"]["isMember"] is True
+
+
+async def test_admin_plan_sort_persists_and_orders(client, admin_headers, session_factory):
+    """后台套餐排序权重：可更新持久化，列表按权重降序、同权重按创建时间降序。
+
+    前置条件：seeded 提供上架月卡（sort=1）。
+    预期行为：
+    - PUT /admin/plans/month {"sort": 9} 成功且返回 sort=9；
+    - 再插入权重 9（更晚创建）与权重 5 的套餐；
+    - GET /admin/plans 依次为「同权重更晚创建」「月卡」「权重 5」；
+    - 公开配置接口返回的套餐顺序与后台一致。
+    断言意图：验证排序字段的接收、持久化与默认排序规则。
+    """
+    r = await client.put("/api/admin/plans/month", headers=admin_headers, json={"sort": 9})
+    assert r.json()["code"] == 0
+    assert r.json()["data"]["sort"] == 9
+
+    base = datetime.now()
+    async with session_factory() as db:
+        db.add_all(
+            [
+                Plan(
+                    id="p_tie",
+                    name="同权重套餐",
+                    duration=7,
+                    duration_label="7 天",
+                    price=9.9,
+                    status="on",
+                    sort=9,
+                    created_at=base + timedelta(seconds=1),
+                ),
+                Plan(
+                    id="p_low",
+                    name="低权重套餐",
+                    duration=3,
+                    duration_label="3 天",
+                    price=3.3,
+                    status="on",
+                    sort=5,
+                    created_at=base + timedelta(seconds=2),
+                ),
+            ]
+        )
+        await db.commit()
+
+    rows = (await client.get("/api/admin/plans", headers=admin_headers)).json()["data"]
+    assert [p["id"] for p in rows][:3] == ["p_tie", "month", "p_low"]
+
+    public = (await client.get("/api/config")).json()["data"]["plans"]
+    assert [p["id"] for p in public][:3] == ["p_tie", "month", "p_low"]
+
+    # 再次读取确认权重已持久化
+    rows2 = (await client.get("/api/admin/plans", headers=admin_headers)).json()["data"]
+    assert next(p for p in rows2 if p["id"] == "month")["sort"] == 9
+
+
+async def test_admin_plan_sort_rejects_negative(client, admin_headers):
+    """排序权重必须为非负整数，负数应被 422 拒绝且不写库。
+
+    断言意图：校验后端对排序权重的合法性约束。
+    """
+    r = await client.put("/api/admin/plans/month", headers=admin_headers, json={"sort": -1})
+    assert r.status_code == 422
+
+    rows = (await client.get("/api/admin/plans", headers=admin_headers)).json()["data"]
+    assert next(p for p in rows if p["id"] == "month")["sort"] == 1
+
+
+async def test_admin_plan_create_defaults_sort_zero(client, admin_headers):
+    """新增套餐未传排序权重时默认写入 0。
+
+    断言意图：确认默认值与前端表单默认值一致。
+    """
+    r = await client.post(
+        "/api/admin/plans",
+        headers=admin_headers,
+        json={"name": "体验卡", "duration": 1, "price": 1.0},
+    )
+    assert r.json()["code"] == 0
+    assert r.json()["data"]["sort"] == 0
 
 
 async def test_membership_invalid_plan(client, normal_headers):

@@ -82,7 +82,6 @@ def test_merge_weather_obs_applies_valid_fields():
         "temp_max": 12,
         "temp_min": 0,
         "temp_feel": 6,
-        "water_temp": 9.5,
         "pressure": 1026.4,
         "pressure_6h": "+2.1",
         "pressure_trend": "up",
@@ -91,7 +90,6 @@ def test_merge_weather_obs_applies_valid_fields():
         "wind_speed": 6.2,
         "humidity": 57,
         "cloud_cover": 60,
-        "rain_prob": 5,
         "rainfall": 0,
         "uv": 3,
         "visibility": 15,
@@ -174,3 +172,38 @@ def test_finalize_shape_matches_frontend_contract():
     for key in ("tempMax", "tempMin", "tempFeel", "windDir", "windLevel", "sunrise", "sunset", "aqiText"):
         assert key in w, f"缺少 camelCase 字段 {key}"
     assert "advice" in data["verdict"]
+
+
+def test_build_slots_recomputes_levels_from_probability():
+    """每个时段的口型必须由其概率按统一阈值生成，而不是沿用模板标签。
+
+    前置条件：整体鱼情分为 90 / 72 / 58 / 22 四档。
+    预期行为：8 个时段的 level/name 均等于 verdict_of(该时段 p) 的结果，
+    p 始终落在 5~99。
+    断言意图：证明全天时段口型严格遵循爆户/连杆/有口/慢口/停口的分级标准。
+    """
+    for overall in (90, 72, 58, 22):
+        slots = ai._build_slots(overall)
+        assert len(slots) == 8
+        for slot in slots:
+            expected = ai.verdict_of(slot["p"])
+            assert slot["level"] == expected["level"], (overall, slot)
+            assert slot["name"] == expected["name"], (overall, slot)
+            assert 5 <= slot["p"] <= 99
+
+
+def test_rainfall_preserved_and_legacy_fields_removed():
+    """降水量保留并 camelCase 输出；水温与降水概率字段不再出现。
+
+    前置条件：上游只给 rainfall=12.3。
+    预期行为：最终 weather.rainfall 为 12.3，且不再包含 waterTemp / rainProb。
+    断言意图：保证降水量完整透传到前端，同时确认两个下线字段已彻底移除。
+    """
+    base = ai._base_weather("浙江省 杭州市 西湖区", None, "2026-11-20")
+    merged = ai._merge_weather_obs({"rainfall": 12.3}, base)
+    data = ai._finalize(merged, "2026-11-20")
+    w = data["weather"]
+
+    assert w["rainfall"] == 12.3
+    assert "waterTemp" not in w
+    assert "rainProb" not in w

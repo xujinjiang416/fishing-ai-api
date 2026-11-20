@@ -21,7 +21,7 @@ def _weather(**over):
     """构造 camelCase 天气观测（对齐 ai._finalize 对外结构）。
 
     Args:
-        **over: 需要覆盖的基础字段，如 waterTemp / pressureTrend / windSpeed。
+        **over: 需要覆盖的基础字段，如 temp / pressureTrend / windSpeed。
 
     Returns:
         dict: 包含地点、天况、温度、气压、风、湿度、日出日落与潮汐等完整键的字典。
@@ -30,10 +30,10 @@ def _weather(**over):
         "place": "安徽省 合肥市 蜀山区",
         "condition": "多云",
         "conditionIcon": "partly",
-        "temp": 18, "tempMax": 22, "tempMin": 12, "tempFeel": 17, "waterTemp": 16.5,
+        "temp": 18, "tempMax": 22, "tempMin": 12, "tempFeel": 17,
         "pressure": 1018.6, "pressure6h": "+2.0", "pressureTrend": "up",
         "windDir": "东北风", "windLevel": "2级", "windSpeed": 3.0,
-        "humidity": 60, "cloudCover": 40, "rainProb": 10, "rainfall": 0,
+        "humidity": 60, "cloudCover": 40, "rainfall": 0,
         "uv": 4, "visibility": 15, "aqi": 47, "aqiText": "优",
         "sunrise": "06:42", "sunset": "17:09", "goldenAm": "06:42-08:10",
         "goldenPm": "15:40-17:09", "solunar": "小潮·鱼口偏弱",
@@ -89,18 +89,18 @@ def test_good_weather_scores_higher_than_bad():
     """多场景验证：好天气总分应显著高于坏天气。
 
     前置条件：
-    - 好天气：水温 18℃、气温 20℃、气压上升、微风、低降雨概率；
-    - 坏天气：水温 2℃、气温 1℃、气压下降、9 级风、85% 降雨、AQI 180。
+    - 好天气：气温 20℃、气压上升、微风、湿度适中；
+    - 坏天气：气温 1℃、气压下降、9 级风、湿度 98%、AQI 180。
     预期行为：好天气得分高于坏天气，且好天气应落入 80 分以上的高分档。
     断言意图：用极端对照验证规则引擎的单调性与区分度。
     """
     good = verdict.rule_verdict(
-        _weather(waterTemp=18, temp=20, pressureTrend="up", windSpeed=2, rainProb=5, humidity=60),
+        _weather(temp=20, pressureTrend="up", windSpeed=2, humidity=60),
         "2026-10-20",
     )
     bad = verdict.rule_verdict(
-        _weather(waterTemp=2, temp=1, tempMax=3, tempMin=-4,
-                 pressureTrend="down", windSpeed=9, rainProb=85, humidity=98, aqi=180, aqiText="中度"),
+        _weather(temp=1, tempMax=3, tempMin=-4,
+                 pressureTrend="down", windSpeed=9, humidity=98, aqi=180, aqiText="中度"),
         "2026-01-10",
     )
     assert good["score"] > bad["score"]
@@ -109,24 +109,26 @@ def test_good_weather_scores_higher_than_bad():
 
 
 def test_normalize_merges_and_falls_back():
-    """LLM 返回部分字段时：合法值保留、缺失维度回退规则结果。
+    """LLM 返回部分字段时：合法值保留、缺失维度回退规则结果、总分按权重回算。
 
     前置条件：payload 仅给出 score=88、一个 feeding 维度（92 分）与 species。
-    预期行为：总分采用 88；维度补齐为 4 项且 feeding 保留 92；
-    species 使用 LLM 结果；缺失的 reason 回退规则引擎文案。
-    断言意图：确认归一化是「合并 + 补齐」而非全量覆盖或全量丢弃。
+    预期行为：总分按分项加权和回算（不直接采用 LLM 的 88）；维度补齐为 4 项且
+    feeding 保留 92；species 使用 LLM 结果；缺失的 reason 回退规则引擎文案。
+    断言意图：确认归一化是「合并 + 补齐」，且总分不会被 LLM 单独覆盖。
     """
     rule = verdict.rule_verdict(_weather(), "2026-11-19")
     payload = {
         "score": 88,
         "dimensions": [
-            {"key": "feeding", "name": "摄食意愿", "score": 92, "reason": "水温16℃适宜"},
+            {"key": "feeding", "name": "摄食意愿", "score": 92, "reason": "气温16℃适宜"},
         ],
         "species": ["鲫鱼", "鲤鱼"],
     }
     out = verdict.normalize(payload, _weather(), "2026-11-19", rule)
 
-    assert out["score"] == 88
+    expected = max(0, min(100, round(sum(d["score"] * d["weight"] for d in out["dimensions"]))))
+    assert out["score"] == expected
+    assert out["score"] != 88  # LLM 总分不再直接生效
     assert len(out["dimensions"]) == 4  # 缺失维度补齐
     feeding = next(d for d in out["dimensions"] if d["key"] == "feeding")
     assert feeding["score"] == 92
@@ -134,18 +136,39 @@ def test_normalize_merges_and_falls_back():
     assert out["reason"] == rule["reason"]   # 未提供 reason 回退规则
 
 
-def test_normalize_invalid_score_clamps():
-    """非法/越界分数被夹取到 0-100。
+def test_normalize_scrubs_water_temperature_terms():
+    """大模型自行补充的水温文案必须被清洗为气温口径。
 
-    前置条件：分别传入 score=200 与非数字字符串 "abc"。
-    预期行为：200 被夹取为 100；"abc" 回退或夹取后仍落在 0-100 区间。
-    断言意图：保证接口输出的分数永远合法，前端无需容错。
+    前置条件：LLM 在分项理由、总体依据、建议中都提到「水温」。
+    预期行为：输出文本不再包含「水温」，统一替换为「气温」。
+    断言意图：保证前端不会出现已下线的水温展示内容。
     """
     rule = verdict.rule_verdict(_weather(), "2026-11-19")
-    out = verdict.normalize({"score": 200}, _weather(), "2026-11-19", rule)
-    assert out["score"] == 100
-    out2 = verdict.normalize({"score": "abc"}, _weather(), "2026-11-19", rule)
-    assert 0 <= out2["score"] <= 100
+    payload = {
+        "dimensions": [
+            {"key": "activity", "score": 60, "reason": "水温偏低压制活性"},
+        ],
+        "reason": "水温 9℃ 偏低，鱼口一般",
+        "advice": "水温低，建议钓深水",
+    }
+    out = verdict.normalize(payload, _weather(), "2026-11-19", rule)
+    text = "".join(d["reason"] for d in out["dimensions"]) + out["reason"] + out["advice"]
+    assert "水温" not in text
+    assert "气温" in text
+
+
+def test_normalize_invalid_score_is_ignored():
+    """非法/越界 LLM 总分不影响结果，总分始终由分项回算且落在 0-100。
+
+    前置条件：分别传入 score=200、非数字字符串 "abc" 与负数 -10。
+    预期行为：三者都输出规则分项加权和，且始终在 0-100 区间。
+    断言意图：保证接口输出的分数永远合法，且不再受 LLM 总分影响。
+    """
+    rule = verdict.rule_verdict(_weather(), "2026-11-19")
+    for raw in (200, "abc", -10):
+        out = verdict.normalize({"score": raw}, _weather(), "2026-11-19", rule)
+        assert out["score"] == rule["score"]
+        assert 0 <= out["score"] <= 100
 
 
 def test_sunshine_hours():
@@ -192,3 +215,120 @@ async def test_judge_weather_without_llm_uses_rule_engine(monkeypatch):
     assert v["aiGenerated"] is False
     # 时段概率已按最终得分重算
     assert all(5 <= s["p"] <= 99 for s in out["slots"])
+
+
+def test_normalize_recomputes_score_from_dimensions():
+    """LLM 给的总分不直接采用，必须按分项权重回算。
+
+    前置条件：payload 总分写死 72，四个分项均为 90。
+    预期行为：输出总分为 90（0.3+0.25+0.3+0.15 加权），而不是 72。
+    断言意图：防止大模型把所有地点统一写成同一个总分。
+    """
+    rule = verdict.rule_verdict(_weather(), "2026-11-19")
+    payload = {
+        "score": 72,
+        "dimensions": [
+            {"key": "feeding", "score": 90, "reason": "a"},
+            {"key": "activity", "score": 90, "reason": "b"},
+            {"key": "bite", "score": 90, "reason": "c"},
+            {"key": "species", "score": 90, "reason": "d"},
+        ],
+    }
+    out = verdict.normalize(payload, _weather(), "2026-11-19", rule)
+    assert out["score"] == 90
+
+
+def test_merge_weather_obs_derives_pressure_trend():
+    """真实天气缺少气压趋势时按真实变化推导，避免所有地点共用 seed 的 up。
+
+    前置条件：上游只给 temp=7、pressure=1023，没有 pressure_trend / pressure_6h。
+    预期行为：气压趋势记为 flat、6 小时变化为 0.0；已提供时保留原值。
+    断言意图：保证不同地点的评分输入随真实气压变化，不再全部是 up。
+    """
+    base = ai._base_weather("安徽省 合肥市 蜀山区", None, "2026-11-20")
+    merged = ai._merge_weather_obs({"temp": 7, "pressure": 1023}, base)
+    assert merged["pressure_trend"] == "flat"
+    assert merged["pressure_6h"] == "0.0"
+    assert "water_temp" not in merged
+
+    # 上游已提供时保留原值，不被推导覆盖
+    merged2 = ai._merge_weather_obs(
+        {"temp": 7, "pressure_trend": "down", "pressure_6h": "-1.2"},
+        base,
+    )
+    assert merged2["pressure_trend"] == "down"
+    assert merged2["pressure_6h"] == "-1.2"
+
+
+async def test_locations_get_differentiated_scores(monkeypatch):
+    """不同地点在相同日期应返回差异化分数，而不是固定 72。
+
+    前置条件：关闭大模型，使用规则引擎；输入不同真实气温（7/11/10/3/-13℃）。
+    预期行为：5 个地点至少产生 3 种不同总分。
+    断言意图：验证气温差异与总分回算后，地点差异能真实反映到出钓指数。
+    """
+    from app.services import llm
+
+    monkeypatch.setattr(llm, "enabled", lambda: False)
+
+    cases = [
+        ("安徽省 合肥市 蜀山区", 7),
+        ("浙江省 杭州市 西湖区", 11),
+        ("广东省 广州市 天河区", 10),
+        ("北京市 北京市 朝阳区", 3),
+        ("黑龙江省 哈尔滨市 道里区", -13),
+    ]
+    scores = []
+    for place, temp in cases:
+        base = ai._base_weather(place, None, "2026-11-20")
+        merged = ai._merge_weather_obs({"temp": temp}, base)
+        data = ai._finalize(merged, "2026-11-20")
+        out = await ai.judge_weather(data, "今天")
+        scores.append(out["verdict"]["score"])
+
+    assert len(set(scores)) >= 3, scores
+
+
+def test_verdict_level_boundaries():
+    """评分等级边界：0-100 全覆盖、无重叠、无遗漏。
+
+    区间定义：
+    - 爆户：90-100
+    - 连杆：75-89
+    - 有口：56-74
+    - 慢口：40-55
+    - 停口：0-39
+
+    断言意图：确认每个边界分值（39/40/55/56/74/75/89/90）都命中正确等级，
+    并逐分遍历 0-100，防止区间出现空档或重复归属。
+    """
+    expected = [
+        (0, "stop", "停口"),
+        (39, "stop", "停口"),
+        (40, "slow", "慢口"),
+        (55, "slow", "慢口"),
+        (56, "fair", "有口"),
+        (74, "fair", "有口"),
+        (75, "hot", "连杆"),
+        (89, "hot", "连杆"),
+        (90, "explode", "爆户"),
+        (100, "explode", "爆户"),
+    ]
+    for score, key, name in expected:
+        lv = ai.verdict_of(score)
+        assert lv["level"] == key, (score, lv)
+        assert lv["name"] == name, (score, lv)
+
+    # 逐分遍历 0-100，确保每个分值都唯一命中一个区间
+    for score in range(101):
+        if score >= 90:
+            key = "explode"
+        elif score >= 75:
+            key = "hot"
+        elif score >= 56:
+            key = "fair"
+        elif score >= 40:
+            key = "slow"
+        else:
+            key = "stop"
+        assert ai.verdict_of(score)["level"] == key, (score, ai.verdict_of(score))

@@ -235,29 +235,29 @@ PROVINCES = [
     ]},
 ]
 
-# 单条天气样例（snake_case）：温度 / 水温为 ℃，气压 hPa，湿度与概率为百分比，
+# 单条天气样例（snake_case）：温度为 ℃，气压 hPa，湿度为百分比，降水量 mm，
 # score 为 0-100 的鱼情评分；仅用于演示与兜底结构参照，不直接写入数据库。
-WEATHER = {"place": "浙江省 杭州市 西湖区", "place_detail": "王家村后塘 · 3 公里范围内", "updated": "2026-11-05 05:40 更新", "condition": "多云转晴", "condition_icon": "cloud", "temp": 17, "temp_max": 22, "temp_min": 11, "temp_feel": 16, "water_temp": 15.5, "pressure": 1018.6, "pressure_6h": "+3.2", "pressure_trend": "up", "wind_dir": "东北风", "wind_level": "2 级", "wind_speed": 3.4, "humidity": 68, "cloud_cover": 45, "rain_prob": 10, "rainfall": 0, "uv": 4, "visibility": 12, "aqi": 42, "aqi_text": "优", "moon_phase": "下弦月", "moon_illum": 34, "sunrise": "06:11", "sunset": "17:12", "golden_am": "06:11 - 07:40", "golden_pm": "15:45 - 17:12", "solunar": "小潮 · 鱼口偏弱", "score": 86}
+WEATHER = {"place": "浙江省 杭州市 西湖区", "place_detail": "王家村后塘 · 3 公里范围内", "updated": "2026-11-05 05:40 更新", "condition": "多云转晴", "condition_icon": "cloud", "temp": 17, "temp_max": 22, "temp_min": 11, "temp_feel": 16, "pressure": 1018.6, "pressure_6h": "+3.2", "pressure_trend": "up", "wind_dir": "东北风", "wind_level": "2 级", "wind_speed": 3.4, "humidity": 68, "cloud_cover": 45, "rainfall": 0, "uv": 4, "visibility": 12, "aqi": 42, "aqi_text": "优", "moon_phase": "下弦月", "moon_illum": 34, "sunrise": "06:11", "sunset": "17:12", "golden_am": "06:11 - 07:40", "golden_pm": "15:45 - 17:12", "solunar": "小潮 · 鱼口偏弱", "score": 86}
 
 # 时段鱼口样例：time 为时间窗，level 对应 VERDICT_LEVELS.key，
 # p 为该时段开口概率（0-100），tip 为给钓友的操作建议。
 SLOTS = [
     {"time": "04:30-06:30", "level": "explode", "name": "爆户", "p": 92, "tip": "天光初亮，鲫鱼上浮抢食"},
     {"time": "06:30-09:00", "level": "explode", "name": "爆户", "p": 95, "tip": "全天最佳，主攻浅滩"},
-    {"time": "09:00-11:30", "level": "hot", "name": "狂口", "p": 78, "tip": "日照升温，鱼往下走"},
+    {"time": "09:00-11:30", "level": "hot", "name": "连杆", "p": 78, "tip": "日照升温，鱼往下走"},
     {"time": "11:30-14:00", "level": "stop", "name": "停口", "p": 18, "tip": "高温低食，建议补窝休息"},
     {"time": "14:00-16:00", "level": "slow", "name": "慢口", "p": 42, "tip": "活性回升，试钓深处"},
-    {"time": "16:00-18:00", "level": "hot", "name": "狂口", "p": 88, "tip": "下午黄金口，注意打频率"},
+    {"time": "16:00-18:00", "level": "hot", "name": "连杆", "p": 88, "tip": "下午黄金口，注意打频率"},
     {"time": "18:00-20:00", "level": "explode", "name": "爆户", "p": 90, "tip": "傍晚第二波高峰"},
-    {"time": "20:00-24:00", "level": "slow", "name": "慢口", "p": 36, "tip": "夜钓守大鱼，用腥饵"},
+    {"time": "20:00-24:00", "level": "stop", "name": "停口", "p": 36, "tip": "夜钓守大鱼，用腥饵"},
 ]
 
 # 鱼情等级字典：key 供程序判断，name 为展示名，min 为进入该等级的最低分，
 # rank 用于排序 / 比较（越大越好），advice 为出钓建议文案。
 VERDICT_LEVELS = [
-    {"key": "explode", "name": "爆户", "min": 88, "rank": 5, "advice": "气压稳中有升、风向到位，鱼群全天开口，建议天一亮就占钓位，窝子打足。"},
-    {"key": "hot", "name": "狂口", "min": 72, "rank": 4, "advice": "鱼活性高，饵到位就有信号，注意保持节奏、及时提竿，别让窝子散了。"},
-    {"key": "fair", "name": "有口", "min": 58, "rank": 3, "advice": "需要打窝养窝，找准钓层与水深，仍能有不错的收获。"},
+    {"key": "explode", "name": "爆户", "min": 90, "rank": 5, "advice": "气压稳中有升、风向到位，鱼群全天开口，建议天一亮就占钓位，窝子打足。"},
+    {"key": "hot", "name": "连杆", "min": 75, "rank": 4, "advice": "鱼活性高，口口相连，饵到位就有信号，保持节奏、及时提竿，别让窝子散了。"},
+    {"key": "fair", "name": "有口", "min": 56, "rank": 3, "advice": "需要打窝养窝，找准钓层与水深，仍能有不错的收获。"},
     {"key": "slow", "name": "慢口", "min": 40, "rank": 2, "advice": "开口零散、信号轻，建议钓深水、减少抛竿频率、用轻灵钓组。"},
     {"key": "stop", "name": "停口", "min": 0, "rank": 1, "advice": "气压骤降或温差过大，鱼基本不开口，建议改天出钓。"},
 ]

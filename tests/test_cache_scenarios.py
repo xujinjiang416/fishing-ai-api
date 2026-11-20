@@ -31,6 +31,33 @@ QUERY = {
 }
 
 
+def test_stale_verdict_cache_is_invalidated():
+    """旧阈值/旧总分口径的缓存条目必须视为未命中。
+
+    前置条件：
+    - old：72 分 + 旧等级 hot/狂口；
+    - current：72 分 + 新等级 fair/有口，且分项加权和等于 72；
+    - inconsistent：72 分 + 新等级，但分项加权和为 90。
+    预期行为：old、inconsistent 判为无效；current 判为有效。
+    断言意图：升级评分规则后，3 小时内的旧缓存不能继续返回固定 72。
+    """
+    from app.services import cache_store
+
+    def dims(scores):
+        return [
+            {"score": s, "weight": w}
+            for s, w in zip(scores, (0.30, 0.25, 0.30, 0.15))
+        ]
+
+    old = {"verdict": {"score": 72, "level": "hot", "name": "狂口", "dimensions": dims([75, 68, 72, 78])}}
+    current = {"verdict": {"score": 72, "level": "fair", "name": "有口", "dimensions": dims([75, 68, 72, 70])}}
+    inconsistent = {"verdict": {"score": 72, "level": "fair", "name": "有口", "dimensions": dims([90, 90, 90, 90])}}
+
+    assert cache_store._cached_verdict_is_valid(old) is False
+    assert cache_store._cached_verdict_is_valid(inconsistent) is False
+    assert cache_store._cached_verdict_is_valid(current) is True
+
+
 class QWeatherCounter:
     """记录上游天气源调用次数，第二次起返回不同温度，便于断言缓存已更新。"""
 
@@ -72,7 +99,10 @@ class LLMCounter:
         self.calls = 0
 
     async def chat(self, messages, **kwargs) -> str:
-        """模拟大模型返回固定鱼情 JSON（score=82），并累加调用次数。
+        """模拟大模型返回固定鱼情 JSON（四个分项与总分均为 82），并累加调用次数。
+
+        注意：normalize 会按分项权重回算总分，因此这里必须给出分项，
+        保证回算结果仍为 82，缓存相关断言才有确定预期。
 
         Args:
             messages: 对话消息列表（本桩不消费，仅为对齐真实签名）。
@@ -84,7 +114,12 @@ class LLMCounter:
         self.calls += 1
         return (
             '{"score": 82, "species": ["鲫鱼", "鲤鱼"], '
-            '"reason": "水温适宜、气压平稳，鱼口活跃", '
+            '"dimensions": ['
+            '{"key": "feeding", "score": 82, "reason": "气温适宜"},'
+            '{"key": "activity", "score": 82, "reason": "活性良好"},'
+            '{"key": "bite", "score": 82, "reason": "开口稳定"},'
+            '{"key": "species", "score": 82, "reason": "鱼种丰富"}],'
+            '"reason": "气温适宜、气压平稳，鱼口活跃", '
             '"advice": "早口占位打窝，主攻鲫鱼"}'
         )
 
@@ -107,7 +142,32 @@ def _patch_upstream(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_repeat_query_within_3h_calls_upstream_once(client, session_factory, monkeypatch):
+async def test_weather_requires_login(client):
+    """未登录查询天气必须返回 401，不允许匿名拿到默认地点评分。
+
+    前置条件：不带 Authorization 头请求 /api/weather。
+    预期行为：HTTP 401，响应体 code=401。
+    断言意图：确认服务端鉴权生效，匿名查询无法绕过。
+    """
+    r = await client.get("/api/weather", params=QUERY)
+    assert r.status_code == 401
+    assert r.json()["code"] == 401
+
+
+async def test_weather_requires_location_after_login(client, normal_headers):
+    """已登录但用户没有定位且未传地址时返回 400，不再回退默认地点。
+
+    前置条件：普通用户 id=1，location 为空；只带 Authorization，不传省市区。
+    预期行为：HTTP 400，响应体 code=400，提示「请先选择位置」。
+    断言意图：避免登录用户因缺少地址而拿到无关城市的固定评分。
+    """
+    r = await client.get("/api/weather", headers=normal_headers)
+    assert r.status_code == 400
+    assert r.json()["code"] == 400
+    assert "选择位置" in r.json()["msg"]
+
+
+async def test_repeat_query_within_3h_calls_upstream_once(client, session_factory, normal_headers, monkeypatch):
     """3 小时内重复查询：天气源与大模型各只调用 1 次，两次返回完全一致。
 
     前置条件：使用 QUERY 固定参数（安徽省 / 合肥市 / 蜀山区 / 2026-11-19），
@@ -119,11 +179,11 @@ async def test_repeat_query_within_3h_calls_upstream_once(client, session_factor
     """
     qw, lc = _patch_upstream(monkeypatch)
 
-    r1 = await client.get("/api/weather", params=QUERY)
+    r1 = await client.get("/api/weather", params=QUERY, headers=normal_headers)
     assert r1.status_code == 200
     d1 = r1.json()["data"]
 
-    r2 = await client.get("/api/weather", params=QUERY)
+    r2 = await client.get("/api/weather", params=QUERY, headers=normal_headers)
     assert r2.status_code == 200
     d2 = r2.json()["data"]
 
@@ -151,7 +211,7 @@ async def test_repeat_query_within_3h_calls_upstream_once(client, session_factor
 
 
 @pytest.mark.asyncio
-async def test_expired_cache_refetches_and_resets_ttl(client, session_factory, monkeypatch):
+async def test_expired_cache_refetches_and_resets_ttl(client, session_factory, normal_headers, monkeypatch):
     """超过 3 小时后：自动重新调用上游、更新缓存并重置有效期。
 
     前置条件：先成功查询一次生成缓存，再手工把两类缓存的 expire_at 改为 1 分钟前。
@@ -161,7 +221,7 @@ async def test_expired_cache_refetches_and_resets_ttl(client, session_factory, m
     """
     qw, lc = _patch_upstream(monkeypatch)
 
-    await client.get("/api/weather", params=QUERY)
+    await client.get("/api/weather", params=QUERY, headers=normal_headers)
     assert qw.calls == 1 and lc.calls == 1
 
     # 模拟 3 小时已过：把两条缓存的有效期改为 1 分钟前
@@ -173,7 +233,7 @@ async def test_expired_cache_refetches_and_resets_ttl(client, session_factory, m
             row.expire_at = past
         await db.commit()
 
-    r2 = await client.get("/api/weather", params=QUERY)
+    r2 = await client.get("/api/weather", params=QUERY, headers=normal_headers)
     assert r2.status_code == 200
     d2 = r2.json()["data"]
 

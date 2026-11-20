@@ -22,10 +22,10 @@ import datetime as dt
 import uuid
 from copy import deepcopy
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ...core.deps import get_db, get_optional_user_id
+from ...core.deps import get_current_user_id, get_db
 from ...core.response import ok
 from ...core.utils import now_text, today
 from ...models import User, WeatherLog
@@ -51,15 +51,15 @@ async def weather(
     city: str | None = None,
     district: str | None = None,
     date: str | None = None,
-    user_id: int | None = Depends(get_optional_user_id),
+    user_id: int = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ):
     """查询天气 + 鱼情研判 + 全天时段概率。
 
-    参数二选一：经纬度，或省/市/区。未登录也可查询，登录后带上个性化偏好。
-    方法与路径：GET /weather（可选登录）。
+    必须登录后查询；未登录返回 401，登录后未传地址且用户也无定位时返回 400。
+    方法与路径：GET /weather（必须登录）。
     参数：lat / lng 经纬度；province / city / district 行政区划（优先结构化地址）；
-    date 查询日期 ISO 字符串（缺省今天，仅取前 10 位）；未传地址且已登录时回退用户定位。
+    date 查询日期 ISO 字符串（缺省今天，仅取前 10 位）；未传地址时回退用户定位。
     响应：{ weather, verdict, slots, aiGenerated, query }；query 回显经纬度与原始日期。
     处理顺序与降级：
     1) 先清理过期缓存（cache_store 内部 10 分钟节流，避免每次全表扫描）；
@@ -67,10 +67,17 @@ async def weather(
     3) 鱼情按全部查询参数哈希缓存，命中则跳过 LLM；未命中且 LLM 失败时由 ai 层回退规则引擎；
     4) 写一条 WeatherLog（记录是否全命中），写库失败仅回滚日志、不影响响应。
     """
-    if not (province or city or district) and user_id:
-        user = await db.get(User, user_id)
-        loc = (user.location or {}) if user else {}
+    user = await db.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=401, detail="登录已过期，请重新登录")
+
+    if not (province or city or district):
+        loc = user.location or {}
         province, city, district = loc.get("province"), loc.get("city"), loc.get("district")
+
+    # 登录后仍无任何地址时不再回退默认地点，避免返回无关城市的固定评分
+    if not (province or city or district):
+        raise HTTPException(status_code=400, detail="请先选择位置")
 
     place = " ".join([x for x in (province, city, district) if x])
     detail = f"{district or city or '当前位置'} · 3 公里范围内" if place else None
@@ -118,7 +125,6 @@ async def weather(
     # 落一条天气查询日志，供管理后台查看 / 重新生成（失败不影响主流程）
     try:
         v = data["verdict"]
-        user = await db.get(User, user_id) if user_id else None
         # 身份成本：会员 / 普通用户（已移除广告解锁、单次付费解锁，统一记为「普通用户」）
         cost = "会员" if (user and user.is_member) else "普通用户"
         db.add(
