@@ -11,6 +11,29 @@
   不直接提供，交由大模型或兜底数据补齐。
 
 参考文档：https://dev.qweather.com/docs/api/weather/weather-now/
+
+职责：
+- 将 QWeather 三个接口的数据映射为内部 snake_case 观测结构；
+- 对上游错误做统一包装（QWeatherError），便于上层降级。
+
+关键数据流：
+  place → GeoAPI 解析 location id/lat/lon
+        → weather/now + weather/3d（基础观测）
+        → airquality/v1/current（AQI，按经纬度）
+        → weather/v1/current（UV，按经纬度）
+        → 合并映射为内部字段返回
+
+依赖：
+- httpx（异步 HTTP 客户端）；
+- app.core.config.settings：qweather_key / qweather_host。
+
+失败降级策略：
+- 基础天气（now/3d）失败直接抛 QWeatherError，由 ai 降级到 LLM/兜底；
+- AQI、UV 为可选增强，失败仅忽略该字段，不影响整体结果。
+
+注意事项：
+- 2026 年起公共域名废弃，必须使用账号专属 Host；
+- 只做「字段映射」，不做缓存与重试，缓存由 cache_store 负责。
 """
 
 import httpx
@@ -27,9 +50,10 @@ def _api_base() -> str:
     return host if host.startswith("https://") else f"https://{host}"
 
 
-GEO_PATH = "/geo/v2/city/lookup"
-WEATHER_NOW_PATH = "/v7/weather/now"
-WEATHER_3D_PATH = "/v7/weather/3d"
+# 端点路径（拼接在账号专属 Host 之后）
+GEO_PATH = "/geo/v2/city/lookup"          # 中文地名 -> Location（id/lat/lon）
+WEATHER_NOW_PATH = "/v7/weather/now"      # 实时天气（温度/湿度/风/气压等）
+WEATHER_3D_PATH = "/v7/weather/3d"        # 3 天预报（最高/最低温、日出日落、风力）
 AIR_QUALITY_PATH = "/airquality/v1/current"   # 实时空气质量（按经纬度，cn-mee 即中国 AQI）
 WEATHER_CURRENT_PATH = "/weather/v1/current"   # 实时天气（含紫外线指数 uvIndex）
 
@@ -39,11 +63,27 @@ class QWeatherError(Exception):
 
 
 def enabled() -> bool:
+    """天气源是否可用：需同时配置 API Key 与专属 Host。
+
+    Returns:
+        bool: True 表示可以发起真实请求。
+    """
     return bool(settings.qweather_key and settings.qweather_host)
 
 
 async def _get_json(url: str, params: dict) -> dict:
-    """发起一次 QWeather 请求并解析；非 200 或业务 code 非 200 抛 QWeatherError。"""
+    """发起一次 QWeather 请求并解析；非 200 或业务 code 非 200 抛 QWeatherError。
+
+    Args:
+        url: 完整请求地址（Host + 端点路径）。
+        params: 查询参数（location 或经纬度、lang 等）。
+
+    Returns:
+        dict: 解析后的响应 JSON。
+
+    Raises:
+        QWeatherError: 网络异常、HTTP 非 2xx、响应不可解析、业务 code 非 200。
+    """
     headers = {"X-QW-Api-Key": settings.qweather_key}
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -73,14 +113,31 @@ async def _get_json(url: str, params: dict) -> dict:
 
 
 async def _lookup_location(place: str) -> dict | None:
-    """用 GeoAPI 把中文地名（省 市 区）解析成 QWeather Location（含 id/lat/lon）。"""
+    """用 GeoAPI 把中文地名（省 市 区）解析成 QWeather Location（含 id/lat/lon）。
+
+    Args:
+        place: 地名文本。
+
+    Returns:
+        dict | None: 首个匹配 Location；无匹配返回 None。
+
+    Raises:
+        QWeatherError: 请求或解析失败（由 _get_json 抛出）。
+    """
     body = await _get_json(_api_base() + GEO_PATH, {"location": place})
     locations = body.get("location") or []
     return locations[0] if locations else None
 
 
 def _map_icon(code: str) -> str:
-    """QWeather 天气图标代码 -> 本项目图标名（sun/cloud/partly/rain）。"""
+    """QWeather 天气图标代码 -> 本项目图标名（sun/cloud/partly/rain）。
+
+    Args:
+        code: QWeather 图标码字符串。
+
+    Returns:
+        str: 本项目图标名；未知代码回退 cloud。
+    """
     c = str(code or "")
     if c in ("100", "150"):
         return "sun"
@@ -92,7 +149,15 @@ def _map_icon(code: str) -> str:
 
 
 def _wind_scale_str(day_scale: str, night_scale: str) -> str:
-    """把风力等级组装成「4-5级转3-4级」样式；白天与夜间相同时只给一段。"""
+    """把风力等级组装成「4-5级转3-4级」样式；白天与夜间相同时只给一段。
+
+    Args:
+        day_scale: 白天风力等级（如 "4-5"）。
+        night_scale: 夜间风力等级。
+
+    Returns:
+        str: 组合后的风力文本；两者皆空时返回空串。
+    """
     day = f"{day_scale}级" if day_scale else ""
     night = f"{night_scale}级" if night_scale else ""
     if day and night and night != day:
@@ -104,6 +169,15 @@ async def fetch_weather(place: str) -> dict:
     """查询该地点的真实天气并映射为内部 snake_case 观测结构。
 
     返回仅包含能可靠映射的字段（缺的字段由调用方回退补齐）；解析失败抛 QWeatherError。
+
+    Args:
+        place: 中文地名（省 市 区）。
+
+    Returns:
+        dict: snake_case 观测字段；AQI/UV 等可选字段可能为 None。
+
+    Raises:
+        QWeatherError: 地名解析失败或基础天气接口失败。
     """
     loc = await _lookup_location(place)
     if not loc:

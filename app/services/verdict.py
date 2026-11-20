@@ -13,6 +13,27 @@
   2. 大模型不可用/失败 → 走确定性规则引擎 rule_verdict()，同样给出分项得分与依据。
 
 说明：本模块消费 camelCase 天气字段（与 ai._finalize 的对外结构一致）。
+
+职责：
+- 把天气观测标准化为大模型可理解的上下文（build_brief）；
+- 规则引擎与 LLM 双路径输出同构的 0-100 分结论；
+- 对 LLM 返回做规范化与兜底，保证字段完整。
+
+关键数据流：
+  weather(camelCase) → build_brief → llm.chat → loads_json
+                     → normalize（缺失字段回退 rule_verdict）
+                     → { score, dimensions, species, reason, advice }
+
+依赖：
+- app.services.llm（OpenAI 兼容接口）：可选，未配置时只用规则引擎。
+
+失败降级策略：
+- llm 未启用 / 调用失败 / JSON 非法：直接返回规则引擎结果（aiGenerated=False）；
+- LLM 缺字段 / 字段非法：逐项回退规则引擎结果，保证结构完整。
+
+注意事项：
+- 权重和固定为 1.0，score 应与分项加权和基本一致；
+- 规则引擎是「可测试基线」，修改阈值需同步关注前端展示口径。
 """
 
 import json
@@ -28,10 +49,12 @@ SCORE_DIMENSIONS = (
     {"key": "species", "name": "鱼种适配度", "weight": 0.15},
 )
 
+# 维度 key -> 维度定义（含中文名与权重），供规范化时查表
 _DIM_MAP = {d["key"]: d for d in SCORE_DIMENSIONS}
 
 
 def _num(value, default: float = 0.0) -> float:
+    """安全转 float；失败回退 default。"""
     try:
         return float(value)
     except (TypeError, ValueError):
@@ -39,11 +62,19 @@ def _num(value, default: float = 0.0) -> float:
 
 
 def _clamp(v: float, lo: int = 0, hi: int = 100) -> int:
+    """四舍五入取整并夹取到 [lo, hi]（默认 0~100）。"""
     return max(lo, min(hi, int(round(v))))
 
 
 def _season(date_str: str | None) -> str:
-    """据日期推断季节（用于鱼种/食性适配）。"""
+    """据日期推断季节（用于鱼种/食性适配）。
+
+    Args:
+        date_str: ISO 日期字符串，可为空。
+
+    Returns:
+        str: 春/夏/秋/冬；解析失败时按当前月份推断。
+    """
     try:
         m = datetime.fromisoformat((date_str or "")[:10]).month
     except ValueError:
@@ -58,7 +89,15 @@ def _season(date_str: str | None) -> str:
 
 
 def _sunshine_hours(sunrise: str, sunset: str) -> str:
-    """由日出/日落（HH:MM）计算日照时长，作为光照维度。"""
+    """由日出/日落（HH:MM）计算日照时长，作为光照维度。
+
+    Args:
+        sunrise: 日出时间（HH:MM）。
+        sunset: 日落时间（HH:MM）。
+
+    Returns:
+        str: 形如 ``12.3 小时``；解析失败返回「未知」。
+    """
     try:
         fmt = "%H:%M"
         a = datetime.strptime(str(sunrise).strip(), fmt)
@@ -74,7 +113,20 @@ def _sunshine_hours(sunrise: str, sunset: str) -> str:
 # ---------------- 规则引擎（确定性兜底 + 校准基线） ----------------
 
 def _feeding_score(w: dict) -> tuple[int, str]:
-    """摄食意愿：水温主驱动，气压趋势与湿度修正。"""
+    """摄食意愿：水温主驱动，气压趋势与湿度修正。
+
+    分步说明：
+    1. 水温缺失时用气温 -1 近似；
+    2. 按水温落在 12~24 / 8~12 或 24~28 / 4~8 或 28~32 / 极端 四档给基础分；
+    3. 气压上升 +6、下降 -12；湿度 >95 或 <20 再 -10；
+    4. 结果夹取到 0~100，并拼接可读依据。
+
+    Args:
+        w: camelCase 天气观测（读取 waterTemp/pressureTrend/humidity）。
+
+    Returns:
+        tuple[int, str]: (摄食意愿得分, 依据文本)。
+    """
     wt = w.get("waterTemp")
     if wt is None:
         wt = _num(w.get("temp"), 15) - 1
@@ -103,7 +155,20 @@ def _feeding_score(w: dict) -> tuple[int, str]:
 
 
 def _activity_score(w: dict) -> tuple[int, str]:
-    """游动活跃度：气温舒适度 + 风力/紫外线修正。"""
+    """游动活跃度：气温舒适度 + 风力/紫外线修正。
+
+    分步说明：
+    1. 气温缺失按 78 分；10~24℃ 给 88 分，边缘区间 64 分，极端 35 分；
+    2. 风速 >8m/s -20、>5m/s -8、其余 +3；
+    3. 紫外线 >9 再 -6；
+    4. 结果夹取到 0~100。
+
+    Args:
+        w: camelCase 天气观测（读取 temp/windSpeed/uv）。
+
+    Returns:
+        tuple[int, str]: (活跃度得分, 依据文本)。
+    """
     t = w.get("temp")
     if t is None:
         s, band = 78, "气温适中"
@@ -133,7 +198,21 @@ def _activity_score(w: dict) -> tuple[int, str]:
 
 
 def _bite_score(w: dict) -> tuple[int, str]:
-    """咬口频率：气压趋势 + 降水概率 + 风力 + 温差。"""
+    """咬口频率：气压趋势 + 降水概率 + 风力 + 温差。
+
+    分步说明：
+    1. 以 75 为基准分；气压上升 +10、下降 -18、平稳不加分；
+    2. 降水概率 <=20% +4，>=70% -22，其余 -8；
+    3. 风速 >8m/s 再 -18；
+    4. 昼夜温差 >10℃ 再 -6；
+    5. 结果夹取到 0~100。
+
+    Args:
+        w: camelCase 天气观测（读取 pressureTrend/rainProb/windSpeed/tempMax/tempMin）。
+
+    Returns:
+        tuple[int, str]: (咬口频率得分, 依据文本)。
+    """
     s = 75
     reasons = []
     if w.get("pressureTrend") == "up":
@@ -173,7 +252,20 @@ def _bite_score(w: dict) -> tuple[int, str]:
 
 
 def _species_score(w: dict, season: str) -> tuple[int, list[str], str]:
-    """鱼种适配度：按水温+季节匹配高适口性鱼种。"""
+    """鱼种适配度：按水温+季节匹配高适口性鱼种。
+
+    分步说明：
+    1. 用内置鱼种的适宜水温区间筛出候选；
+    2. 冬季只保留耐寒鱼种，最多取 4 种；
+    3. 按候选数量映射分数：>=4 得 90，3 得 78，2 得 60，1 得 40，0 得 20。
+
+    Args:
+        w: camelCase 天气观测（读取 waterTemp/temp）。
+        season: 季节中文名（春/夏/秋/冬）。
+
+    Returns:
+        tuple[int, list[str], str]: (适配度得分, 适宜鱼种列表, 依据文本)。
+    """
     wt = w.get("waterTemp")
     if wt is None:
         wt = _num(w.get("temp"), 15) - 1
@@ -205,7 +297,21 @@ def _species_score(w: dict, season: str) -> tuple[int, list[str], str]:
 
 
 def rule_verdict(weather: dict, date_str: str | None = None) -> dict:
-    """确定性规则评分：返回与 LLM 输出同构的可解释结论（0-100 分）。"""
+    """确定性规则评分：返回与 LLM 输出同构的可解释结论（0-100 分）。
+
+    计算步骤：
+    1. 由日期推断季节；
+    2. 分别计算 4 个维度得分与依据；
+    3. 按权重加权求和得到总分（夹取 0~100）；
+    4. 根据咬口/摄食分生成一句可执行建议。
+
+    Args:
+        weather: camelCase 天气观测。
+        date_str: 查询日期（ISO），用于季节推断。
+
+    Returns:
+        dict: score、dimensions、species、reason、advice。
+    """
     season = _season(date_str)
     feed, feed_reason = _feeding_score(weather)
     act, act_reason = _activity_score(weather)
@@ -243,6 +349,7 @@ def rule_verdict(weather: dict, date_str: str | None = None) -> dict:
 
 # ---------------- 大模型研判 ----------------
 
+# 鱼情研判提示词：固定 JSON 结构与权重口径，要求依据引用具体数值，便于校验。
 _LLM_SYSTEM_PROMPT = (
     "你是资深鱼类行为学与垂钓专家。根据给定的结构化天气数据，"
     "结合鱼类摄食行为学规律、不同鱼种生活习性，以及不同季节与地域的垂钓经验，"
@@ -267,7 +374,20 @@ _LLM_SYSTEM_PROMPT = (
 
 
 def build_brief(weather: dict, place: str | None, date_str: str | None, day_label: str) -> dict:
-    """清洗/规整为注入大模型的结构化天气上下文。"""
+    """清洗/规整为注入大模型的结构化天气上下文。
+
+    把 camelCase 字段转成中文键值描述，缺失值以 None 占位，
+    便于模型直接阅读并减少 hallucination。
+
+    Args:
+        weather: camelCase 天气观测。
+        place: 地点名。
+        date_str: 查询日期。
+        day_label: 中文日期标签。
+
+    Returns:
+        dict: 中文键名的结构化上下文。
+    """
     trend = {"up": "上升", "down": "下降", "flat": "平稳"}.get(weather.get("pressureTrend"), "平稳")
     return {
         "地点": place,
@@ -292,7 +412,15 @@ def build_brief(weather: dict, place: str | None, date_str: str | None, day_labe
 
 
 def _coerce_dimension(item: dict, fallback: dict) -> dict:
-    """把 LLM 返回的单个维度规整为 {key,name,score,weight,reason}。"""
+    """把 LLM 返回的单个维度规整为 {key,name,score,weight,reason}。
+
+    Args:
+        item: LLM 返回的维度对象。
+        fallback: 对应 key 的规则引擎维度（作为字段兜底）。
+
+    Returns:
+        dict: 规范化后的维度；非 dict 输入直接返回 fallback。
+    """
     if not isinstance(item, dict):
         return fallback
     key = item.get("key") or fallback["key"]
@@ -308,7 +436,22 @@ def _coerce_dimension(item: dict, fallback: dict) -> dict:
 
 
 def normalize(payload: dict, weather: dict, date_str: str | None, rule: dict) -> dict:
-    """把 LLM 返回 JSON 规范化，缺损字段回退规则引擎结果，保证结构完整。"""
+    """把 LLM 返回 JSON 规范化，缺损字段回退规则引擎结果，保证结构完整。
+
+    分步说明：
+    1. 维度：按 key 去重并逐个规范化，LLM 漏掉的维度用规则引擎补齐；
+    2. 总分：LLM 未给时用分项加权和；
+    3. 鱼种 / 依据 / 建议：LLM 为空时分别回退规则引擎值，并做长度截断。
+
+    Args:
+        payload: LLM 解析后的 JSON。
+        weather: camelCase 天气观测（保持与其他研判函数签名一致，当前未使用）。
+        date_str: 查询日期（保持签名一致，当前未使用）。
+        rule: rule_verdict 的规则引擎结果（兜底来源）。
+
+    Returns:
+        dict: 结构完整的 {score, dimensions, species, reason, advice}。
+    """
     if not isinstance(payload, dict):
         return rule
 
@@ -356,7 +499,17 @@ def normalize(payload: dict, weather: dict, date_str: str | None, rule: dict) ->
 
 
 async def judge(weather: dict, place: str | None, date_str: str | None, day_label: str) -> dict:
-    """鱼情研判主入口：大模型可用走 LLM，否则走规则引擎；返回带 aiGenerated 标记的结论。"""
+    """鱼情研判主入口：大模型可用走 LLM，否则走规则引擎；返回带 aiGenerated 标记的结论。
+
+    Args:
+        weather: camelCase 天气观测。
+        place: 地点名。
+        date_str: 查询日期。
+        day_label: 中文日期标签。
+
+    Returns:
+        dict: ``{"result": 结论, "aiGenerated": bool}``；LLM 失败时 result 为规则引擎结果。
+    """
     rule = rule_verdict(weather, date_str)
     if not llm.enabled():
         return {"result": rule, "aiGenerated": False}

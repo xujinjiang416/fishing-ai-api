@@ -11,6 +11,22 @@
 - `get_int(db, key)`：读取单个整数配置（带默认值兜底，避免配置缺失导致功能报错）。
 - `apply_updates(db, updates)`：批量写入配置（后台保存时调用）。
 - `clear_cache()`：清空内存缓存（后台写入后自动调用）。
+
+关键数据流：
+  请求 → _raw_map（进程内缓存 15 秒，否则查 app_configs + 默认值）
+       → _coerce 按类型/范围转换 → snapshot / get_int / config_values
+
+依赖：
+- 数据库 app_configs 表（键值对持久化）；
+- app.core.config.settings（默认值来源，保证配置缺失时可用）。
+
+失败降级策略：
+- 配置缺失 / 非法一律回退默认值，业务不因配置问题报错；
+- 套餐查询异常时 plans 返回空列表，不影响积分规则返回。
+
+注意事项：
+- _cache 为进程内缓存，多实例部署时各实例独立，最长 15 秒数据不一致；
+- apply_updates 不提交事务，需与业务写入同事务提交。
 """
 
 import time
@@ -30,6 +46,16 @@ class ConfigDef:
     __slots__ = ("key", "default", "kind", "remark", "min", "max")
 
     def __init__(self, key: str, default, kind: str, remark: str, min=None, max=None):
+        """初始化单个配置项定义。
+
+        Args:
+            key: 配置键名（对应 app_configs.key）。
+            default: 默认值（取自 settings）。
+            kind: 类型，``"int"`` 或 ``"str"``。
+            remark: 后台展示说明。
+            min: 整数下界（含），None 表示不限。
+            max: 整数上界（含），None 表示不限。
+        """
         self.key = key
         self.default = default
         self.kind = kind        # "int" / "str"
@@ -60,12 +86,12 @@ CONFIG_DEFS: dict[str, ConfigDef] = {
     ),
 }
 
-# 键 -> 默认字符串值
+# 键 -> 默认字符串值（数据库中的值统一以字符串存储）
 DEFAULTS: dict[str, str] = {k: str(v.default) for k, v in CONFIG_DEFS.items()}
 
 # ---- 服务端短 TTL 内存缓存：避免每次读库；write 时主动失效 ----
-_CACHE_TTL = 15.0  # 秒
-_cache: dict = {"at": 0.0, "raw": None}
+_CACHE_TTL = 15.0  # 秒：缓存有效期，后台写入会立即清空
+_cache: dict = {"at": 0.0, "raw": None}  # at=写入时间戳，raw=全量配置快照
 
 
 def clear_cache() -> None:
@@ -75,7 +101,15 @@ def clear_cache() -> None:
 
 
 def _coerce(defn: ConfigDef, value: str):
-    """把数据库里的字符串按定义转成期望类型；非法值回退默认值（保证功能不报错）。"""
+    """把数据库里的字符串按定义转成期望类型；非法值回退默认值（保证功能不报错）。
+
+    Args:
+        defn: 配置项定义（含类型与取值范围）。
+        value: 数据库中的原始字符串。
+
+    Returns:
+        int | str: 转换后的值；整数超出 [min, max] 时夹取到边界。
+    """
     if defn.kind == "int":
         try:
             n = int(str(value).strip())
@@ -90,7 +124,14 @@ def _coerce(defn: ConfigDef, value: str):
 
 
 async def _raw_map(db: AsyncSession) -> dict[str, str]:
-    """读取全部配置（带缓存），缺失的键用默认值补齐。"""
+    """读取全部配置（带缓存），缺失的键用默认值补齐。
+
+    Args:
+        db: 异步数据库会话。
+
+    Returns:
+        dict[str, str]: 全量配置的字符串映射。
+    """
     now = time.time()
     if _cache["raw"] is not None and now - _cache["at"] < _CACHE_TTL:
         return _cache["raw"]
@@ -105,7 +146,15 @@ async def _raw_map(db: AsyncSession) -> dict[str, str]:
 
 
 async def get_int(db: AsyncSession, key: str) -> int:
-    """读取单个整数配置；键不存在或值非法时返回默认值。"""
+    """读取单个整数配置；键不存在或值非法时返回默认值。
+
+    Args:
+        db: 异步数据库会话。
+        key: 配置键名。
+
+    Returns:
+        int: 配置值；未登记键尽力解析，失败返回 0。
+    """
     defn = CONFIG_DEFS.get(key)
     raw = await _raw_map(db)
     if defn is None:
@@ -118,13 +167,28 @@ async def get_int(db: AsyncSession, key: str) -> int:
 
 
 async def get_str(db: AsyncSession, key: str) -> str:
-    """读取单个字符串配置；键不存在时返回默认值。"""
+    """读取单个字符串配置；键不存在时返回默认值。
+
+    Args:
+        db: 异步数据库会话。
+        key: 配置键名。
+
+    Returns:
+        str: 配置值；未登记键返回空串。
+    """
     raw = await _raw_map(db)
     return raw.get(key, DEFAULTS.get(key, ""))
 
 
 async def config_values(db: AsyncSession) -> dict[str, int]:
-    """读取全部「业务配置」的强类型快照（供内部逻辑直接使用）。"""
+    """读取全部「业务配置」的强类型快照（供内部逻辑直接使用）。
+
+    Args:
+        db: 异步数据库会话。
+
+    Returns:
+        dict[str, int]: 仅包含 int 类型配置项的键值。
+    """
     raw = await _raw_map(db)
     out: dict[str, int] = {}
     for key, defn in CONFIG_DEFS.items():
@@ -137,6 +201,12 @@ async def snapshot(db: AsyncSession) -> dict:
     """聚合成前端可直接消费的结构（camelCase）。
 
     小程序端只需读取本结构即可获得：签到积分规则、广告积分规则、会员套餐列表。
+
+    Args:
+        db: 异步数据库会话。
+
+    Returns:
+        dict: camelCase 配置快照（pointsPerYuan/checkin/ad/plans）。
     """
     v = await config_values(db)
     # 仅返回「上架」的会员套餐，按排序值升序；数据库异常时返回空列表兜底
@@ -190,6 +260,13 @@ async def apply_updates(db: AsyncSession, updates: dict) -> list[tuple[str, str,
 
     updates 允许包含 int / str / None；None 表示该键本次不修改。
     调用方负责 `await db.commit()`；本函数不做提交，保证与业务写入同事务。
+
+    Args:
+        db: 异步数据库会话。
+        updates: {配置键: 新值}，未登记的键会被忽略。
+
+    Returns:
+        list[tuple[str, str, str]]: [(key, 旧值, 新值)]；无变化时不记录。
     """
     changes: list[tuple[str, str, str]] = []
     raw = await _raw_map(db)

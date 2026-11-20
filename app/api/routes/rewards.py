@@ -6,6 +6,14 @@
   已移除历史上「看广告后完成签到」的全部逻辑与「连续 7 天额外奖励」。
 - 广告：观看广告仅用于「赚取积分」，不再用于解锁任何内容；
   单次积分与每日额度同样由后台积分配置决定，实现后台改配置即时生效。
+
+鉴权要求：三个接口均需用户登录（Authorization: Bearer <user token>），无管理员接口。
+
+依赖服务：MySQL（users / checkin_records / ad_rewards 表）、services.config_service
+（积分配置，带 15 秒内存缓存）、user.add_points（统一积分变动与流水入口）。
+
+注意事项：积分值全部实时读取后台配置；同一自然日重复签到返回业务错误而非 500；
+日期口径统一取 core.utils.today()（本地时区日期字符串）。
 """
 
 from datetime import date, timedelta
@@ -30,7 +38,15 @@ CHECKIN_DAYS = ["一", "二", "三", "四", "五", "六", "日"]
 async def checkin_status(
     user_id: int = Depends(get_current_user_id), db: AsyncSession = Depends(get_db)
 ):
-    """返回今日签到状态、连续天数与积分规则（积分值实时取自后台配置）。"""
+    """查询今日签到状态。
+
+    返回今日签到状态、连续天数与积分规则（积分值实时取自后台配置）。
+    方法与路径：GET /checkin（需登录）。
+    响应：checkedToday 今日是否已签到、streak 当前连续天数、maxStreak 历史最长、
+    isMember 是否会员、dailyPoints 当前身份对应积分、memberPoints / normalPoints 两档规则、
+    days 星期标签、date 展示用中文日期。
+    说明：纯读接口，不写入任何数据；配置缺失时由 config_service 回退默认值（5 / 1）。
+    """
     user = await db.get(User, user_id)
     member_points = await config_service.get_int(db, "checkin_member_points")
     normal_points = await config_service.get_int(db, "checkin_normal_points")
@@ -54,7 +70,16 @@ async def checkin_status(
 async def do_checkin(
     user_id: int = Depends(get_current_user_id), db: AsyncSession = Depends(get_db)
 ):
-    """执行签到：会员发放配置的会员积分、非会员发放配置的非会员积分。"""
+    """执行每日签到。
+
+    方法与路径：POST /checkin（需登录）。
+    幂等：同一自然日重复调用返回 fail(1001, "今日已签到")，不会重复发放积分。
+    连续天数：上次签到为昨天则 +1，否则重置为 1，并同步更新历史最长连续天数。
+    积分：按身份读取 checkin_member_points / checkin_normal_points（默认 5 / 1），
+    经 add_points 统一入账并写积分流水。
+    响应：本次积分、连续天数、当前余额、checkedToday；签到记录的 bonus 恒为 0
+    （已取消连续 7 天额外奖励）。
+    """
     user = await db.get(User, user_id)
     if user.last_checkin_date == today():
         return fail(1001, "今日已签到", {"checkedToday": True, "streak": user.streak})
@@ -93,8 +118,14 @@ async def do_checkin(
 async def ad_reward(
     user_id: int = Depends(get_current_user_id), db: AsyncSession = Depends(get_db)
 ):
-    """观看广告赚积分：单次积分与每日额度均实时读取后台配置。
+    """观看广告领取积分。
 
+    方法与路径：POST /ads/reward（需登录），客户端需在广告播放成功后调用。
+    频次控制：跨天（ads_date != 今天）自动清零当日计数；当日次数达到后台配置的
+    会员 / 非会员额度后返回 fail(1001)，额度 ≤ 0 视为不可观看。
+    积分：ad_points 实时读取后台配置；累加 ads_watched_today / ad_points_today，
+    并通过 add_points 入账、写入 AdReward 记录。
+    响应：本次积分、今日已看次数、额度上限、当前余额。
     注意：广告仅用于「赚取积分」，不再承担任何「解锁内容」的职责。
     """
     user = await db.get(User, user_id)

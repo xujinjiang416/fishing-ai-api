@@ -1,5 +1,21 @@
-"""seed_data.py — 由原型 js/mock.js 转写的初始化数据（纯数据，不含任何逻辑）"""
+"""seed_data.py — 由原型 js/mock.js 转写的初始化数据（纯数据，不含任何逻辑）
 
+职责：
+- 为 `app.seed` 提供省市县、商品、会员套餐等静态种子；
+- 为天气 / 鱼情演示页面提供可直接消费的样例结构（WEATHER / SLOTS / VERDICT_LEVELS 等）。
+
+使用方式：
+- 仅作为模块级常量被导入，不做任何 I/O，也不依赖数据库；
+- 修改本文件只影响「首次灌库」的结果，不会覆盖库中已有记录。
+
+注意事项：
+- 键名分两类：数据库 / 接口层使用 snake_case（如 temp_max），前端 mock 使用 camelCase；
+  本文件按原型保持原样，调用方（seed.py / ai.py）负责映射；
+- 价格单位为元，评分 / 概率为 0-100 的整数，气压单位为 hPa，气温单位为 ℃。
+"""
+
+# 行政区划种子：省 -> 市 -> 区县 三层；名称用于收货地址合法性校验与级联下拉，
+# 列表顺序即展示顺序（seed.py 按 enumerate 下标写入 sort）。
 PROVINCES = [
     {"name": "河北省", "cities": [
         {"name": "石家庄市", "districts": ["长安区", "桥西区", "新华区", "裕华区", "正定县"]},
@@ -219,8 +235,12 @@ PROVINCES = [
     ]},
 ]
 
+# 单条天气样例（snake_case）：温度 / 水温为 ℃，气压 hPa，湿度与概率为百分比，
+# score 为 0-100 的鱼情评分；仅用于演示与兜底结构参照，不直接写入数据库。
 WEATHER = {"place": "浙江省 杭州市 西湖区", "place_detail": "王家村后塘 · 3 公里范围内", "updated": "2026-11-05 05:40 更新", "condition": "多云转晴", "condition_icon": "cloud", "temp": 17, "temp_max": 22, "temp_min": 11, "temp_feel": 16, "water_temp": 15.5, "pressure": 1018.6, "pressure_6h": "+3.2", "pressure_trend": "up", "wind_dir": "东北风", "wind_level": "2 级", "wind_speed": 3.4, "humidity": 68, "cloud_cover": 45, "rain_prob": 10, "rainfall": 0, "uv": 4, "visibility": 12, "aqi": 42, "aqi_text": "优", "moon_phase": "下弦月", "moon_illum": 34, "sunrise": "06:11", "sunset": "17:12", "golden_am": "06:11 - 07:40", "golden_pm": "15:45 - 17:12", "solunar": "小潮 · 鱼口偏弱", "score": 86}
 
+# 时段鱼口样例：time 为时间窗，level 对应 VERDICT_LEVELS.key，
+# p 为该时段开口概率（0-100），tip 为给钓友的操作建议。
 SLOTS = [
     {"time": "04:30-06:30", "level": "explode", "name": "爆户", "p": 92, "tip": "天光初亮，鲫鱼上浮抢食"},
     {"time": "06:30-09:00", "level": "explode", "name": "爆户", "p": 95, "tip": "全天最佳，主攻浅滩"},
@@ -232,6 +252,8 @@ SLOTS = [
     {"time": "20:00-24:00", "level": "slow", "name": "慢口", "p": 36, "tip": "夜钓守大鱼，用腥饵"},
 ]
 
+# 鱼情等级字典：key 供程序判断，name 为展示名，min 为进入该等级的最低分，
+# rank 用于排序 / 比较（越大越好），advice 为出钓建议文案。
 VERDICT_LEVELS = [
     {"key": "explode", "name": "爆户", "min": 88, "rank": 5, "advice": "气压稳中有升、风向到位，鱼群全天开口，建议天一亮就占钓位，窝子打足。"},
     {"key": "hot", "name": "狂口", "min": 72, "rank": 4, "advice": "鱼活性高，饵到位就有信号，注意保持节奏、及时提竿，别让窝子散了。"},
@@ -259,6 +281,8 @@ PLANS = [
     },
 ]
 
+# 商品种子：id 为固定业务编号（g1-g8），price / orig 为现价与划线价（元），
+# sales 为展示用销量文案，tags 为标签，spec 为规格描述，stock 为可售库存。
 GOODS = [
     {
         "id": "g1", "name": "碳素轻量台钓竿 4.5m", "cat": "鱼竿", "price": 199.0, "orig": 259.0,
@@ -310,6 +334,7 @@ GOODS = [
     },
 ]
 
+# 广告创意样例：brand / slogan / cta 分别对应广告主的品牌名、文案与按钮文字。
 AD_CREATIVES = [
     {"brand": "渔乐无穷 · 户外", "slogan": "全场钓具满 199 减 60，新手套装立省一半", "cta": "立即抢购"},
     {"brand": "湖岸咖啡", "slogan": "出钓路上，一杯现磨提提神", "cta": "了解详情"},
@@ -317,4 +342,7 @@ AD_CREATIVES = [
     {"brand": "东岸渔具仓", "slogan": "碳素竿 4.5m 直降 100，顺丰次日达", "cta": "查看优惠"},
 ]
 
+# 签到规则样例：daily_points 每日基础积分，member_extra 会员额外积分（当前为 0，
+# 会员差异由配置项 checkin_member_points 单独控制），week_bonus / week_bonus_day
+# 为连续签到满 N 天的额外奖励，days 为一周的中文标签。
 CHECKIN = {"daily_points": 10, "member_extra": 0, "week_bonus": 50, "week_bonus_day": 7, "days": ["一", "二", "三", "四", "五", "六", "日"]}

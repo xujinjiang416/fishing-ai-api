@@ -1,9 +1,21 @@
 """weather.py — 钓鱼天气查询
 
+职责：小程序天气页唯一数据入口，一次请求同时返回天气数据、鱼情研判结论与
+全天时段出钓概率。
+
+鉴权要求：公开接口，登录可选；登录且未传行政区划时按用户定位查询。
+
+依赖服务：
+- 上游天气源 QWeather（经 services.ai 封装；未配置 key / host 时退回大模型或本地规则兜底）；
+- 大模型（services.ai.judge_weather，失败时内部自动回退规则引擎）；
+- MySQL（weather_cache / fish_cache / weather_logs 表，由 services.cache_store 读写）。
+
 缓存策略（统一 3 小时有效期，全流程生效）：
 - 天气数据：按「标准化地址 + 日期」缓存，3 小时内重复查询不再调用和风天气；
 - 鱼情分析：按「全部查询参数哈希」缓存，3 小时内重复请求不再调用大模型；
 - 过期后下一次查询自动重新拉取并重置有效期，无需人工干预。
+
+注意事项：缓存清理、日志落库等旁路操作失败均不影响主流程返回。
 """
 
 import datetime as dt
@@ -42,7 +54,19 @@ async def weather(
     user_id: int | None = Depends(get_optional_user_id),
     db: AsyncSession = Depends(get_db),
 ):
-    """参数二选一：经纬度，或省/市/区。未登录也可查询，登录后带上个性化偏好。"""
+    """查询天气 + 鱼情研判 + 全天时段概率。
+
+    参数二选一：经纬度，或省/市/区。未登录也可查询，登录后带上个性化偏好。
+    方法与路径：GET /weather（可选登录）。
+    参数：lat / lng 经纬度；province / city / district 行政区划（优先结构化地址）；
+    date 查询日期 ISO 字符串（缺省今天，仅取前 10 位）；未传地址且已登录时回退用户定位。
+    响应：{ weather, verdict, slots, aiGenerated, query }；query 回显经纬度与原始日期。
+    处理顺序与降级：
+    1) 先清理过期缓存（cache_store 内部 10 分钟节流，避免每次全表扫描）；
+    2) 天气按「标准化地址 + 日期」缓存，命中则跳过上游；地点与更新时间按本次入参重算；
+    3) 鱼情按全部查询参数哈希缓存，命中则跳过 LLM；未命中且 LLM 失败时由 ai 层回退规则引擎；
+    4) 写一条 WeatherLog（记录是否全命中），写库失败仅回滚日志、不影响响应。
+    """
     if not (province or city or district) and user_id:
         user = await db.get(User, user_id)
         loc = (user.location or {}) if user else {}

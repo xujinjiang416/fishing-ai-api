@@ -1,4 +1,19 @@
-"""spots.py — 附近野塘列表 / 详情 / 评论"""
+"""spots.py — 附近野塘列表 / 详情 / 评论
+
+职责：按用户位置返回野塘列表（首次或过期时由大模型生成并落库）、野塘详情、
+评论列表与评论发布。
+
+鉴权要求：列表 / 详情 / 评论列表为公开接口（登录后可按用户定位返回）；
+发布评论必须登录（Authorization: Bearer <user token>）。
+
+依赖服务：MySQL（spots / spot_comments 表）、services.ai（生成、排序、距离截断）、
+services.llm（LLMError 异常）、services.sensitive（敏感词校验）、
+services.config_service（后台可配置的补充敏感词）。
+
+注意事项：
+- 钓点按「区」维度缓存，超过 REFRESH_DAYS 天才重新生成，并用进程内锁避免并发重复生成；
+- 管理员手工维护（added_by 非空）的钓点不会被批量替换，也不参与过期判断。
+"""
 
 import asyncio
 from datetime import datetime, timedelta
@@ -111,7 +126,18 @@ async def list_spots(
     user_id: int | None = Depends(get_optional_user_id),
     db: AsyncSession = Depends(get_db),
 ):
-    """传省/市/区则返回该城市的钓点（首次查询时由大模型生成并发入库）；不传则返回全部。"""
+    """附近野塘列表。
+
+    传省/市/区则返回该城市的钓点（首次查询时由大模型生成并发入库）；不传则返回全部。
+
+    方法与路径：GET /spots（可选登录）。
+    查询参数：keyword 关键词（匹配名称 / 鱼种 / 地址）；sort 预留排序字段（当前排序由
+    ai.rank_spots 按距离升序处理）；province / city / district 行政区划，未传且已登录时
+    回退用户定位。
+    缓存：region 取「市 + 区」（无区则用省），为空时返回全库在线钓点；数据缺失或超过
+    REFRESH_DAYS 天未刷新时调用大模型重新生成。
+    响应：钓点数组（含封面兜底），仅包含上架（status 非 offline）钓点。
+    """
     if not (province or city or district) and user_id:
         user = await db.get(User, user_id)
         loc = (user.location or {}) if user else {}
@@ -145,6 +171,12 @@ async def spot_detail(
     user_id: int | None = Depends(get_optional_user_id),
     db: AsyncSession = Depends(get_db),
 ):
+    """野塘详情。
+
+    方法与路径：GET /spots/{spot_id}（可选登录）。
+    响应：钓点详情 + 评论；gallery 为空时用封面兜底为单图数组。
+    说明：按 id 直接返回，不校验上架状态；不存在返回 404。
+    """
     spot = await db.get(Spot, spot_id)
     if not spot:
         raise HTTPException(status_code=404, detail="野塘不存在")
@@ -157,6 +189,11 @@ async def spot_detail(
 
 @router.get("/{spot_id}/comments", summary="野塘评论列表")
 async def list_comments(spot_id: str, db: AsyncSession = Depends(get_db)):
+    """野塘评论列表。
+
+    方法与路径：GET /spots/{spot_id}/comments（公开）。
+    响应：评论数组，按 id 倒序（即时间倒序）；不校验钓点是否存在。
+    """
     rows = await db.scalars(
         select(SpotComment)
         .where(SpotComment.spot_id == spot_id)
@@ -172,6 +209,16 @@ async def post_comment(
     user_id: int = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ):
+    """发布评论（需登录）。
+
+    方法与路径：POST /spots/{spot_id}/comments。
+    请求参数 CommentIn：text 评论内容；rating 评分 1~5（默认 5）；images 图片地址数组。
+    校验：钓点必须存在（否则 404）；内容先过敏感词（内置词库 + 后台配置 sensitive_words），
+    命中则返回 fail(1001) 且不落库。
+    副作用：写入评论、钓点评论数 +1；该塘无封面时用首张评论图作为封面
+    （cover_from=comment）。
+    响应：新评论结构。
+    """
     spot = await db.get(Spot, spot_id)
     if not spot:
         raise HTTPException(status_code=404, detail="野塘不存在")

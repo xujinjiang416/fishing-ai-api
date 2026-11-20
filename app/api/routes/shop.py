@@ -1,4 +1,16 @@
-"""shop.py — 商城商品 / 下单"""
+"""shop.py — 商城商品 / 下单
+
+职责：小程序端商品浏览与下单，支持积分抵扣，下单后调用微信支付统一下单。
+
+鉴权要求：商品列表 / 详情为公开接口；下单必须登录（Authorization: Bearer <user token>）。
+
+依赖服务：MySQL（goods / orders / order_logs / user_addresses / users 表）、
+services.wechat.create_payment（支付参数，未配置 appid 时返回模拟支付结果）、
+user.add_points（积分扣减并写流水）。
+
+注意事项：下单会快照收货地址与商品信息，地址后续修改不影响历史订单；
+积分抵扣受「不超过订单金额」与「不超过用户可用积分」双重上限约束。
+"""
 
 from datetime import datetime
 
@@ -20,6 +32,13 @@ router = APIRouter(tags=["商城"])
 
 @router.get("/goods", summary="商品列表（可按分类筛选，只显示上架商品）")
 async def list_goods(cat: str | None = None, db: AsyncSession = Depends(get_db)):
+    """商品列表。
+
+    方法与路径：GET /goods（公开）。
+    查询参数：cat 分类名，为空或「全部」时不筛选。
+    响应：商品数组（goods_out），仅返回上架商品（status 为空或非 "off"）。
+    说明：不分页，按数据库默认顺序返回。
+    """
     stmt = select(Goods).where(or_(Goods.status.is_(None), Goods.status != "off"))
     if cat and cat != "全部":
         stmt = stmt.where(Goods.cat == cat)
@@ -29,6 +48,11 @@ async def list_goods(cat: str | None = None, db: AsyncSession = Depends(get_db))
 
 @router.get("/goods/{goods_id}", summary="商品详情")
 async def goods_detail(goods_id: str, db: AsyncSession = Depends(get_db)):
+    """商品详情。
+
+    方法与路径：GET /goods/{goods_id}（公开）。
+    响应：单个商品结构；商品不存在返回 404（不区分是否已下架）。
+    """
     goods = await db.get(Goods, goods_id)
     if not goods:
         raise HTTPException(status_code=404, detail="商品不存在")
@@ -41,6 +65,18 @@ async def create_order(
     user_id: int = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ):
+    """下单（支持积分抵扣）。
+
+    方法与路径：POST /orders（需登录）。
+    请求参数 OrderIn：goodsId 商品 id；qty 数量（≥1，默认 1）；usePoints 拟用积分（≥0，默认 0）；
+    addressId 收货地址 id（必填且必须属于当前用户）；payMethod / deliveryType 可选。
+    校验：商品存在（否则 404）；库存充足（否则业务错误 1001）；地址归属校验失败返回 1002。
+    金额：total = 单价 × 数量；可抵扣积分上限 = min(用户积分, total × points_per_yuan)；
+    实付金额 = max(0.01, total - 抵扣积分 / points_per_yuan)，最低 0.01 元。
+    副作用（同一次 commit）：扣减积分并写流水、扣减库存、创建订单与 create 日志；
+    收货信息按所选地址快照（省 + 市（与省不同时）+ 区 + 详细地址）。
+    响应：订单结构 + orderNo / payAmount / usePoints / payment（微信支付参数或模拟结果）。
+    """
     goods = await db.get(Goods, payload.goodsId)
     if not goods:
         raise HTTPException(status_code=404, detail="商品不存在")

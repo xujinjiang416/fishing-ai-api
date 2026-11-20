@@ -1,7 +1,22 @@
 """seed.py — 幂等初始化数据
 
-执行：python -m app.seed
-也可以在服务启动时自动调用（见 main.py）。
+职责：
+- 建表（create_all）并为已存在的旧库补齐新增列（_ensure_columns）；
+- 清理早期写死的种子钓点（_purge_legacy_spots）；
+- 灌入省市县 / 商品 / 演示用户与演示订单 / 管理员 / 会员套餐 / 天气日志 / 积分配置。
+
+执行方式：
+- 命令行：`python -m app.seed`（脚本入口在文件末尾）；
+- 也可在服务启动时调用 `run_seed()`（见 main.py），传入已有会话可复用同一事务。
+
+前置条件：
+- 数据库连接由 `app.core.database` 的 engine / SessionLocal 决定（默认 MySQL，可通过 .env 覆盖）；
+- 演示账号与管理员账号的手机号 / 密码取自 `settings`（demo_phone / demo_password、admin_username / admin_password）。
+
+注意事项：
+- 所有写入均以「表为空才插入」或「按唯一键查重后补齐」的方式实现，可反复执行；
+- 种子数据仅用于开发 / 演示，生产环境应通过后台维护真实数据；
+- 修改种子内容不会覆盖已存在记录，需手工清理对应表后重跑。
 """
 
 import asyncio
@@ -31,14 +46,29 @@ from .models import (
 from .seed_data import GOODS, PLANS, PROVINCES
 from .services import ai, config_service
 
+# 内置演示账号的登录名（users.account）；手机号与密码见 settings.demo_phone / demo_password
 DEMO_ACCOUNT = "demo"
 
 
 async def _count(db: AsyncSession, model) -> int:
+    """统计指定表的行数，作为「是否已灌入种子」的幂等判据。
+
+    Args:
+        db: 异步数据库会话。
+        model: 目标 ORM 模型类。
+
+    Returns:
+        表内行数；查询结果为 NULL 时返回 0。
+    """
     return await db.scalar(select(func.count()).select_from(model)) or 0
 
 
 async def _seed_geo(db: AsyncSession) -> None:
+    """写入省 / 市 / 区县三级行政区划（仅当 provinces 表为空时执行）。
+
+    数据源为 `seed_data.PROVINCES`，层级结构为「省 -> 市 -> 区县」；
+    `sort` 取列表下标，保证前端下拉按原始顺序展示。整体一次提交，避免半成品数据。
+    """
     if await _count(db, Province):
         return
     for pi, p in enumerate(PROVINCES):
@@ -55,6 +85,11 @@ async def _seed_geo(db: AsyncSession) -> None:
 
 
 async def _seed_goods(db: AsyncSession) -> None:
+    """写入商品种子（仅当 goods 表为空时执行）。
+
+    字段取自 `seed_data.GOODS`：id 为固定业务编号（如 g1），价格 / 划线价单位元，
+    tags 为展示标签列表，stock 为库存，缺失的可选字段用 get 兜底（tags 为空列表）。
+    """
     if await _count(db, Goods):
         return
     for g in GOODS:
@@ -77,7 +112,18 @@ async def _seed_goods(db: AsyncSession) -> None:
 
 
 async def _seed_demo_user(db: AsyncSession) -> None:
-    """内置演示账号：用「演示手机号 + 演示密码」直接登录，数据与原型保持一致。"""
+    """内置演示账号：用「演示手机号 + 演示密码」直接登录，数据与原型保持一致。
+
+    幂等策略：以 account == "demo" 查重；已存在时只补齐缺失的手机号 / 密码哈希，
+    不覆盖等级、积分等运行期可能被改动的字段。
+
+    账号默认值：手机号 settings.demo_phone（默认 13800138000），
+    密码 settings.demo_password（默认 123456），登录名 demo。
+
+    同时写入 4 笔演示订单，覆盖待支付 / 待发货 / 已发货 / 已完成四种状态，
+    并按 `days_ago` 回推下单时间，保证后台订单看板开箱可用。
+    仅在演示用户首次创建时写入，重复执行不会重复插入。
+    """
     demo_hash = hash_password(settings.demo_password)
     existing = await db.scalar(select(User).where(User.account == DEMO_ACCOUNT))
     if existing:
@@ -114,6 +160,8 @@ async def _seed_demo_user(db: AsyncSession) -> None:
     await db.flush()
 
     # 演示订单：覆盖待支付 / 待发货 / 已发货 / 已完成 四种状态，便于后台订单管理开箱可用
+    # 字段含义：total 商品总额、use_points 抵扣积分、pay_amount 实付金额（元）、
+    # days_ago 为相对今天回溯的天数（决定 created_at）
     today_date = date.today()
     demo_orders = [
         {
@@ -209,7 +257,11 @@ async def _seed_demo_user(db: AsyncSession) -> None:
 
 
 async def _seed_admin(db: AsyncSession) -> None:
-    """内置管理后台账号（admins 表，与小程序 users 分表）。"""
+    """内置管理后台账号（admins 表，与小程序 users 分表）。
+
+    幂等策略：以 username == settings.admin_username 查重；已存在时仅补齐缺失的密码哈希。
+    默认账号：settings.admin_username / settings.admin_password，角色为「超级管理员」，状态 normal。
+    """
     admin_hash = hash_password(settings.admin_password)
     existing = await db.scalar(select(Admin).where(Admin.username == settings.admin_username))
     if existing:
@@ -231,6 +283,11 @@ async def _seed_admin(db: AsyncSession) -> None:
 
 
 async def _seed_plans(db: AsyncSession) -> None:
+    """写入会员套餐种子（仅当 plans 表为空时执行）。
+
+    数据源为 `seed_data.PLANS`：duration 为有效天数，price / orig 为现价与原价（元），
+    tag_type 控制前端标签配色，benefits 为权益文案列表；sales 初始为 0，status 固定上架（on）。
+    """
     if await _count(db, Plan):
         return
     for p in PLANS:
@@ -255,6 +312,7 @@ async def _seed_plans(db: AsyncSession) -> None:
 
 
 # 演示天气日志样本：分数/天气/地点铺满近 7 天，保证看板趋势与列表首屏有数据
+# 每项含义：(鱼情评分 0-100, 天气描述, 气温 ℃, 气压 hPa, 钓点位置描述)
 _SEED_LOGS = [
     ("86", "多云转晴", 17.0, 1018.6, "王家村后塘 · 3 公里范围内"),
     ("74", "晴", 19.0, 1016.2, "钱塘江支流 · 3 公里范围内"),
@@ -268,6 +326,13 @@ _SEED_LOGS = [
 
 
 async def _seed_weather_logs(db: AsyncSession) -> None:
+    """写入演示用户的天气查询日志（仅当 weather_logs 表为空时执行）。
+
+    依赖演示账号已存在（account = demo），否则直接返回；
+    按 `_SEED_LOGS` 逐条生成，日期从「今天 - 7 天」连续铺到昨天，
+    评分经 `ai.verdict_of` 换算为等级 / 名称，来源、解锁方式、风力等字段按下标轮换取值，
+    保证后台筛选与图表都有多态样本。重复执行不会重复插入。
+    """
     if await _count(db, WeatherLog):
         return
     demo = await db.scalar(select(User).where(User.account == DEMO_ACCOUNT))
@@ -302,6 +367,16 @@ async def _seed_weather_logs(db: AsyncSession) -> None:
 
 
 async def run_seed(db: AsyncSession | None = None) -> None:
+    """初始化入口：先补齐表结构，再按需灌入全部种子数据。
+
+    Args:
+        db: 可选的异步会话。传入时直接复用（由调用方管理提交与关闭）；
+            不传则内部创建 `SessionLocal` 会话。
+
+    说明：建表 / 补列 / 清理旧钓点通过 engine.begin() 的同步连接执行，
+    因此无论是否传入会话都会生效；seed 数据写入不具备跨步骤事务性，
+    各子步骤内部自行 commit，便于失败后重跑。
+    """
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_ensure_columns)
@@ -316,7 +391,12 @@ async def run_seed(db: AsyncSession | None = None) -> None:
 
 
 def _ensure_columns(sync_conn) -> None:
-    """给已存在的库补上新增列（create_all 不会修改已有表）。"""
+    """给已存在的库补上新增列（create_all 不会修改已有表）。
+
+    逐表比对 information_schema 中的列集合，缺失时执行 ALTER TABLE ADD COLUMN；
+    对带 NOT NULL 默认值的新列，额外回填历史行的 NULL 值。
+    仅做「加列」不做改列 / 删列，重复执行时所有分支都会跳过，幂等安全。
+    """
     insp = sa.inspect(sync_conn)
 
     cols = {c["name"] for c in insp.get_columns("users")}
@@ -430,6 +510,11 @@ async def _seed_configs(db: AsyncSession) -> None:
 
 
 async def _seed_all(db: AsyncSession) -> None:
+    """按依赖顺序依次执行各数据集种子写入。
+
+    顺序要求：行政区划 / 商品 / 演示用户先落库，天气日志依赖演示用户，
+    套餐与配置相互独立；每步内部自带幂等判断。
+    """
     await _seed_geo(db)
     await _seed_goods(db)
     await _seed_demo_user(db)

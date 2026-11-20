@@ -2,6 +2,23 @@
 
 统一封装操作日志的落库，保证「配置变更 / 评论删除」等关键动作都有迹可循。
 调用方负责 `await db.commit()`，本模块只负责 `db.add(...)`，以便与业务写入同事务。
+
+职责：
+- 集中定义操作动作常量，避免各路由散落魔法字符串；
+- 统一构造 OperationLog 记录（管理员 / 动作 / 对象 / 详情 / IP）。
+
+关键数据流：
+  路由调用 add_log(...) → db.add(log) → 调用方 commit 时一并落库
+
+依赖：数据库 operation_logs 表（SQLAlchemy AsyncSession）。
+
+失败降级策略：
+- 本模块不捕获异常、不做提交，写入失败由调用方的业务事务统一回滚；
+- admin 为空时按「系统管理员」记录，保证系统任务也有迹可循。
+
+注意事项：
+- 不要在 add_log 内 commit，否则会破坏调用方的原子性；
+- detail 建议使用人类可读文本，便于后台审计。
 """
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,6 +53,12 @@ def add_log(
     - target：操作对象标识（配置键 / 评论 id 等）；
     - detail：人类可读的变更详情；
     - ip：来源 IP。
+
+    Returns:
+        OperationLog: 已加入会话、尚未提交的日志对象。
+
+    Raises:
+        无：仅构造对象，异常由调用方事务处理。
     """
     log = OperationLog(
         admin_id=getattr(admin, "id", None),

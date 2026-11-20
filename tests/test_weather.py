@@ -4,13 +4,26 @@
 1. 提示词覆盖网页端天气报告的完整字段（气温范围 / 当前温度 / AQI / 湿度 / 日出日落 / 风力含「转」等）；
 2. 大模型返回的 JSON 能正确合并到兜底结构，缺失/非法字段回退；
 3. 大模型未配置时 generate_weather 回退确定性数据且结构完整（接口不报错）。
+
+执行方式：在 fishing-ai-api 目录运行 `pytest tests/test_weather.py`；
+异步用例依赖 pytest.ini 的 asyncio_mode = auto。
+
+前置条件与注意事项：
+- 除 test_generate_weather_falls_back_without_llm 外均为纯函数测试，不依赖网络；
+- 该用例通过 monkeypatch 同时关闭 llm 与 qweather，确保走确定性兜底路径。
 """
 
 from app.services import ai, qweather
 
 
 def test_weather_prompt_covers_required_fields():
-    """提示词必须覆盖与网页端一致的完整天气字段。"""
+    """提示词必须覆盖与网页端一致的完整天气字段。
+
+    前置条件：读取 ai._WEATHER_SYSTEM_PROMPT 常量。
+    预期行为：天况、温度、体感、湿度、AQI、风向风力、日出日落、气压、评分
+    等字段名均出现在提示词中。
+    断言意图：防止调整提示词时遗漏字段，导致大模型输出残缺结构。
+    """
     prompt = ai._WEATHER_SYSTEM_PROMPT
     # 网页端天气报告的关键字段
     required = [
@@ -23,7 +36,12 @@ def test_weather_prompt_covers_required_fields():
 
 
 def test_qweather_icon_mapping():
-    """QWeather 图标代码映射到本项目图标名。"""
+    """QWeather 图标代码映射到本项目图标名。
+
+    前置条件：无（直接调用 qweather._map_icon）。
+    预期行为：100/150 -> sun，103 -> partly，305/400 -> rain，104/500 -> cloud。
+    断言意图：保证第三方代码与前端图标名稳定对应。
+    """
     assert qweather._map_icon("100") == "sun"
     assert qweather._map_icon("150") == "sun"
     assert qweather._map_icon("103") == "partly"
@@ -34,7 +52,13 @@ def test_qweather_icon_mapping():
 
 
 def test_qweather_wind_scale():
-    """风力等级：同等级不重复，昼夜不同用「转」连接。"""
+    """风力等级：同等级不重复，昼夜不同用「转」连接。
+
+    前置条件：无（直接调用 qweather._wind_scale_str）。
+    预期行为：日 / 夜等级不同时输出「A级转B级」；相同时只输出一次；
+    任一侧为空时取非空值；两侧皆空返回空字符串。
+    断言意图：避免出现「3级转3级」这类冗余文案。
+    """
     assert qweather._wind_scale_str("4-5", "3-4") == "4-5级转3-4级"
     assert qweather._wind_scale_str("4", "4") == "4级"
     assert qweather._wind_scale_str("3", "") == "3级"
@@ -43,7 +67,13 @@ def test_qweather_wind_scale():
 
 
 def test_merge_weather_obs_applies_valid_fields():
-    """大模型返回的完整观测能覆盖兜底值，且数值/文本分别被正确归一。"""
+    """大模型返回的完整观测能覆盖兜底值，且数值/文本分别被正确归一。
+
+    前置条件：base 为 _base_weather 的兜底结构；payload 为一份完整观测。
+    预期行为：place 保留兜底值（不由观测覆盖），其余字段（天况、温度、
+    湿度、AQI、风向风力、日出日落、评分）均采用 payload 值。
+    断言意图：确认合并策略为「字段级覆盖」而非整结构替换。
+    """
     base = ai._base_weather("安徽省 合肥市 蜀山区", "蜀山区·3公里范围内", "2026-11-19")
 
     payload = {
@@ -95,7 +125,12 @@ def test_merge_weather_obs_applies_valid_fields():
 
 
 def test_merge_weather_obs_rejects_invalid_values():
-    """非法数值回退兜底、非法字符串忽略，保证结构完整。"""
+    """非法数值回退兜底、非法字符串忽略，保证结构完整。
+
+    前置条件：payload 中 temp="abc"（非数字）、condition=""（空串）、humidity=99（合法）。
+    预期行为：temp 与 condition 保持兜底值，humidity 正常覆盖为 99。
+    断言意图：确认单字段脏数据不会污染整体结构或抛异常。
+    """
     base = ai._base_weather("杭州", "西湖区", None)
     w = ai._merge_weather_obs({"temp": "abc", "condition": "", "humidity": 99}, base)
 
@@ -105,7 +140,13 @@ def test_merge_weather_obs_rejects_invalid_values():
 
 
 async def test_generate_weather_falls_back_without_llm(monkeypatch):
-    """大模型/天气源未配置时返回结构完整的确定性数据（离线、确定）。"""
+    """大模型/天气源未配置时返回结构完整的确定性数据（离线、确定）。
+
+    前置条件：monkeypatch 关闭 llm.enabled 与 qweather.enabled。
+    预期行为：返回 weather / verdict / slots 三段；weather.place 为传入地点，
+    且温度、湿度、日出、日落等关键字段存在。
+    断言意图：保证无任何外部依赖时接口仍可返回可用数据。
+    """
     from app.services import llm, qweather
 
     monkeypatch.setattr(llm, "enabled", lambda: False)
@@ -121,7 +162,13 @@ async def test_generate_weather_falls_back_without_llm(monkeypatch):
 
 
 def test_finalize_shape_matches_frontend_contract():
-    """最终输出 camelCase 字段与前端（weather.vue）消费结构一致。"""
+    """最终输出 camelCase 字段与前端（weather.vue）消费结构一致。
+
+    前置条件：build_weather("杭州", "西湖区", None) 走确定性兜底。
+    预期行为：weather 含 tempMax / tempMin / tempFeel / windDir / windLevel /
+    sunrise / sunset / aqiText 等 camelCase 键，verdict 含 advice。
+    断言意图：防止后端字段蛇形命名或缺失导致前端渲染空值。
+    """
     data = ai.build_weather("杭州", "西湖区", None)
     w = data["weather"]
     for key in ("tempMax", "tempMin", "tempFeel", "windDir", "windLevel", "sunrise", "sunset", "aqiText"):

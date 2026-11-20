@@ -8,6 +8,13 @@
 - 缓存有效期规则配置（天气 / 鱼情，默认 3 小时）
 - 统计看板（总数 / 占用空间 / 命中率 / 近 7 天趋势 / 即将过期）
 - 高危操作（刷新 / 删除 / 规则修改）仅超级管理员，操作全程留痕
+
+鉴权要求：所有接口均需管理后台 token（Authorization: Bearer <admin token>）；
+刷新 / 删除 / 规则保存等高危操作仅「超级管理员」可执行。
+依赖服务：MySQL（weather_cache / fish_cache / weather_logs 表）、services.cache_policy（TTL 规则）、
+services.cache_store（重建缓存）、services.oplog（操作留痕）。
+注意事项：`GET /{cache_id}` 为动态路由，必须注册在所有静态子路径之后，
+否则会抢先匹配 /stats、/rules、/fish 等路径。
 """
 
 import datetime as dt
@@ -27,16 +34,19 @@ router = APIRouter(prefix="/admin/cache", tags=["缓存管理"])
 
 
 def _page_args(page: int, page_size: int) -> tuple[int, int, int]:
+    """规范化分页参数：页码最小 1；每页条数限制在 1~100（缺省 10）；返回 (页码, 条数, 偏移量)。"""
     page = max(1, page or 1)
     page_size = min(max(1, page_size or 10), 100)
     return page, page_size, (page - 1) * page_size
 
 
 def _res_404(name: str) -> HTTPException:
+    """构造统一的 404 异常（缓存记录不存在）。"""
     return HTTPException(status_code=404, detail=f"{name}不存在")
 
 
 def _admin_ip(request: Request | None) -> str | None:
+    """取操作来源 IP 写入操作日志；取不到时返回 None，不影响主流程。"""
     try:
         return request.client.host if (request and request.client) else None
     except Exception:
@@ -44,10 +54,12 @@ def _admin_ip(request: Request | None) -> str | None:
 
 
 def _fmt(ts) -> str | None:
+    """datetime 格式化为后台展示用 `YYYY-MM-DD HH:MM:SS`；空值返回 None。"""
     return ts.strftime("%Y-%m-%d %H:%M:%S") if ts else None
 
 
 def _status_of(expire_at, now: dt.datetime) -> str:
+    """由过期时间推导缓存状态：expire_at 为空视为永不过期（active），早于当前时间即 expired。"""
     return "expired" if (expire_at is not None and expire_at < now) else "active"
 
 
@@ -115,6 +127,14 @@ async def list_cache(
     admin: Admin = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
+    """天气缓存列表（后台）。
+
+    方法与路径：GET /admin/cache（需登录管理员）。
+    查询参数：keyword 模糊匹配地区 / 缓存键；status=active|expired 按过期时间过滤（其他值不过滤）；
+    source 来源筛选（"all" 视为不筛选）；startDate / endDate 按创建日期闭区间（仅取前 10 位日期）；
+    page 从 1 开始；pageSize 1~100（默认 10）。
+    响应：{ list: 天气缓存摘要[], total, page, pageSize }，按 id 倒序。
+    """
     page, page_size, offset = _page_args(page, pageSize)
     stmt = select(WeatherCache)
 
@@ -158,6 +178,12 @@ async def list_fish_cache(
     admin: Admin = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
+    """鱼情缓存列表（后台）。
+
+    方法与路径：GET /admin/cache/fish（需登录管理员）。
+    查询参数与天气列表一致：keyword / status / source / startDate / endDate / page / pageSize。
+    响应：{ list: 鱼情缓存摘要[], total, page, pageSize }，按 id 倒序。
+    """
     page, page_size, offset = _page_args(page, pageSize)
     stmt = select(FishCache)
 
@@ -193,6 +219,13 @@ async def list_fish_cache(
 async def cache_stats(
     admin: Admin = Depends(get_current_admin), db: AsyncSession = Depends(get_db)
 ):
+    """缓存统计看板。
+
+    方法与路径：GET /admin/cache/stats（需登录管理员）。
+    响应：totalCount / weatherCount / fishCount、占用空间（字节与 KB）、今日命中率、
+    24 小时内即将过期数量，以及近 7 天命中趋势（基于 weather_logs.cache_hit，缺失日期补 0）。
+    说明：命中率 = 今日命中条数 / 今日查询总数，今日无查询时记 0。
+    """
     now = dt.datetime.now()
     weather_total = await db.scalar(select(func.count()).select_from(WeatherCache)) or 0
     fish_total = await db.scalar(select(func.count()).select_from(FishCache)) or 0
@@ -272,6 +305,11 @@ async def cache_stats(
 async def get_rules(
     admin: Admin = Depends(get_current_admin), db: AsyncSession = Depends(get_db)
 ):
+    """读取缓存有效期规则。
+
+    方法与路径：GET /admin/cache/rules（需登录管理员）。
+    响应：{ weather: 秒, fish: 秒 }，默认各 10800 秒（3 小时），持久化在 app_configs。
+    """
     return ok(await cache_policy.get_rules(db))
 
 
@@ -282,6 +320,14 @@ async def save_rules(
     admin: Admin = Depends(get_super_admin),
     db: AsyncSession = Depends(get_db),
 ):
+    """保存缓存有效期规则（高危，仅超级管理员）。
+
+    方法与路径：PUT /admin/cache/rules。
+    请求参数 CacheRulesIn：weather / fish 为 TTL 秒数，最小 60，默认 10800。
+    副作用：写入 app_configs 并记录操作日志（cache.rule.update）；保存后新的缓存读写
+    立即按新 TTL 计算过期时间。
+    响应：保存后的规则。
+    """
     rules = {"weather": payload.weather, "fish": payload.fish}
     await cache_policy.save_rules(db, rules)
     oplog.add_log(
@@ -304,6 +350,13 @@ async def batch_refresh(
     admin: Admin = Depends(get_super_admin),
     db: AsyncSession = Depends(get_db),
 ):
+    """批量刷新天气缓存（高危，仅超级管理员）。
+
+    方法与路径：POST /admin/cache/batch-refresh。
+    请求参数 CacheBatchIn：ids 为天气缓存主键列表，空列表返回业务错误 1001。
+    行为：逐条调用 cache_store.rebuild_weather 重新拉取上游天气；单条失败跳过、不中断整批。
+    响应：{ refreshed: 成功条数 }；操作日志仅记录前 20 个 id。
+    """
     ids = [i for i in (payload.ids or []) if i]
     if not ids:
         return fail(1001, "请选择要刷新的缓存")
@@ -335,6 +388,12 @@ async def batch_delete(
     admin: Admin = Depends(get_super_admin),
     db: AsyncSession = Depends(get_db),
 ):
+    """批量删除天气缓存（高危，仅超级管理员）。
+
+    方法与路径：POST /admin/cache/batch-delete。
+    请求参数 CacheBatchIn：ids 为天气缓存主键列表，空列表返回业务错误 1001。
+    行为：仅删除存在的记录，不存在的 id 静默忽略；响应 { deleted: 实际删除条数 }。
+    """
     ids = [i for i in (payload.ids or []) if i]
     if not ids:
         return fail(1001, "请选择要删除的缓存")
@@ -360,6 +419,12 @@ async def batch_delete_fish(
     admin: Admin = Depends(get_super_admin),
     db: AsyncSession = Depends(get_db),
 ):
+    """批量删除鱼情缓存（高危，仅超级管理员）。
+
+    方法与路径：POST /admin/cache/fish/batch-delete。
+    请求参数 CacheBatchIn：ids 为鱼情缓存主键列表，空列表返回业务错误 1001。
+    行为：仅删除存在的记录，响应 { deleted: 实际删除条数 }。
+    """
     ids = [i for i in (payload.ids or []) if i]
     if not ids:
         return fail(1001, "请选择要删除的缓存")
@@ -385,6 +450,12 @@ async def refresh_cache(
     admin: Admin = Depends(get_super_admin),
     db: AsyncSession = Depends(get_db),
 ):
+    """刷新单条天气缓存（高危，仅超级管理员）。
+
+    方法与路径：POST /admin/cache/{cache_id}/refresh。
+    行为：按该条缓存的地点 / 日期重新请求上游天气，重置 payload、来源与过期时间（按当前 TTL）。
+    响应：{ cache: 刷新后的摘要 }；缓存不存在返回 404；上游异常向外抛出（由全局异常处理）。
+    """
     row = await db.get(WeatherCache, cache_id)
     if not row:
         raise _res_404("缓存")
@@ -410,6 +481,11 @@ async def delete_cache(
     admin: Admin = Depends(get_super_admin),
     db: AsyncSession = Depends(get_db),
 ):
+    """删除单条天气缓存（高危，仅超级管理员）。
+
+    方法与路径：DELETE /admin/cache/{cache_id}。
+    响应：成功返回空 data；缓存不存在返回 404；操作日志记录被删缓存的地区与日期。
+    """
     row = await db.get(WeatherCache, cache_id)
     if not row:
         raise _res_404("缓存")
@@ -434,6 +510,12 @@ async def fish_cache_detail(
     admin: Admin = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
+    """鱼情缓存详情（完整分析结果）。
+
+    方法与路径：GET /admin/cache/fish/{fish_id}（需登录管理员）。
+    响应：{ cache: 摘要, payload: 大模型 / 规则引擎原始结论, params: 生成时的查询参数 }；
+    不存在返回 404。
+    """
     row = await db.get(FishCache, fish_id)
     if not row:
         raise _res_404("缓存")
@@ -447,6 +529,11 @@ async def delete_fish_cache(
     admin: Admin = Depends(get_super_admin),
     db: AsyncSession = Depends(get_db),
 ):
+    """删除单条鱼情缓存（高危，仅超级管理员）。
+
+    方法与路径：DELETE /admin/cache/fish/{fish_id}。
+    响应：成功返回空 data；不存在返回 404；操作日志记录被删缓存的缓存键。
+    """
     row = await db.get(FishCache, fish_id)
     if not row:
         raise _res_404("缓存")
@@ -470,6 +557,12 @@ async def cache_detail(
     admin: Admin = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
+    """天气缓存详情（完整天气数据）。
+
+    方法与路径：GET /admin/cache/{cache_id}（需登录管理员）。
+    响应：{ cache: 摘要, payload: 上游天气原始数据 }；不存在返回 404。
+    注意：本动态路由置于文件末尾注册，避免与 /stats、/rules、/fish 等静态路由冲突。
+    """
     row = await db.get(WeatherCache, cache_id)
     if not row:
         raise _res_404("缓存")
